@@ -1,0 +1,132 @@
+# =========================================================
+
+# Environment / secrets
+
+# Keep .env.example tracked, never commit real env files
+
+# =========================================================
+
+.env
+.env.*
+!.env.example
+
+# API keys / signing secrets
+
+*.jks
+*.keystore
+key.properties
+android/key.properties
+
+# =========================================================
+
+# Flutter / Dart / Pub
+
+# =========================================================
+
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+.pub-cache/
+.pub/
+build/
+/build/
+coverage/
+**/doc/api/
+
+# Symbolication / obfuscation
+
+app.*.symbols
+app.*.map.json
+
+# =========================================================
+
+# Android / Gradle generated files
+
+# =========================================================
+
+.gradle/
+android/.gradle/
+android/.kotlin/
+android/app/bin/
+android/local.properties
+
+# Android build outputs
+
+/android/app/debug
+/android/app/profile
+/android/app/release
+
+# APK / bundle outputs
+
+*.apk
+*.aab
+
+# =========================================================
+
+# iOS / macOS generated files
+
+# =========================================================
+
+ios/Flutter/Generated.xcconfig
+ios/Flutter/flutter_export_environment.sh
+ios/Flutter/.last_build_id
+ios/Flutter/ephemeral/
+ios/Pods/
+
+macos/Flutter/GeneratedPluginRegistrant.swift
+macos/Flutter/ephemeral/
+macos/Pods/
+
+# =========================================================
+
+# Linux / Windows Flutter generated files
+
+# =========================================================
+
+linux/flutter/ephemeral/
+windows/flutter/ephemeral/
+
+# =========================================================
+
+# Supabase CLI local metadata
+
+# =========================================================
+
+supabase/.temp/
+
+# =========================================================
+
+# IDE / editor files
+
+# =========================================================
+
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# VS Code is optional.
+
+# Keep this commented if you want to share launch/tasks config.
+
+#.vscode/
+
+# =========================================================
+
+# OS / misc
+
+# =========================================================
+
+.DS_Store
+*.class
+*.log
+*.pyc
+*.swp
+.atom/
+.build/
+.buildlog/
+.history
+.svn/
+.swiftpm/
+migrate_working_dir/
