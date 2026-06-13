@@ -291,7 +291,7 @@ class _KotaShellState extends State<KotaShell> {
             NavigationDestination(
                 icon: Icon(Icons.groups_outlined),
                 selectedIcon: Icon(Icons.groups),
-                label: 'Customers'),
+                label: 'People'),
             NavigationDestination(
                 icon: Icon(Icons.upload_file_outlined),
                 selectedIcon: Icon(Icons.upload_file),
