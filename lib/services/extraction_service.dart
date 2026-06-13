@@ -12,7 +12,10 @@ class ExtractionException implements Exception {
 
 /// Calls the `extract-requests` Supabase Edge Function. The Supabase client
 /// attaches the signed-in user's JWT automatically, so the function can
-/// authenticate the request. Gemini is NEVER called from the app.
+/// authenticate the request, run Gemini, and save the extracted requests
+/// itself. Gemini is NEVER called from the app, and the app no longer inserts
+/// `meal_requests` directly — the function does all of that server-side and
+/// returns an [ImportSummary].
 class ExtractionService {
   ExtractionService([SupabaseClient? client])
       : _client = client ?? Supabase.instance.client;
@@ -21,9 +24,12 @@ class ExtractionService {
 
   static const _functionName = 'extract-requests';
 
-  Future<ExtractionResult> extract({
+  /// Sends the raw chat to the server, which parses it, extracts requests,
+  /// saves them as pending `meal_requests`, and returns a summary of counts.
+  Future<ImportSummary> importChat({
     required String chatText,
     required String source, // 'paste' | 'file'
+    String? fileName,
     DateTime? today,
   }) async {
     final day = today ?? DateTime.now();
@@ -36,26 +42,31 @@ class ExtractionService {
         body: {
           'chatText': chatText,
           'source': source,
+          if (fileName != null) 'fileName': fileName,
           'today': todayIso,
         },
       );
 
       final data = response.data;
       if (data is! Map) {
-        throw ExtractionException('Unexpected response from the extractor.');
+        throw ExtractionException('Unexpected response from the importer.');
       }
-      return ExtractionResult.fromJson(Map<String, dynamic>.from(data));
+      final summary = ImportSummary.fromJson(Map<String, dynamic>.from(data));
+      if (!summary.ok) {
+        throw ExtractionException(summary.error ?? 'Import failed. Please try again.');
+      }
+      return summary;
     } on FunctionException catch (e) {
       if (e.status == 401) {
         throw ExtractionException(
             'Your session expired. Please sign out and sign in again.');
       }
       throw ExtractionException(
-          'Extraction service failed (code ${e.status}). Please try again.');
+          'Import service failed (code ${e.status}). Please try again.');
     } catch (e) {
       if (e is ExtractionException) rethrow;
       throw ExtractionException(
-          'Could not reach the extraction service. Check your connection.');
+          'Could not reach the import service. Check your connection.');
     }
   }
 }

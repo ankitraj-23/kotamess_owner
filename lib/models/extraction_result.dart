@@ -72,3 +72,57 @@ class ExtractionResult {
     return ExtractionResult(requests: rawRequests, warnings: warnings);
   }
 }
+
+/// Summary returned by the `extract-requests` Edge Function after it has parsed
+/// the chat, extracted requests, and saved them as pending `meal_requests`
+/// server-side. The app no longer inserts requests itself — it just reports
+/// these counts and sends the owner to the Requests review screen.
+class ImportSummary {
+  final String? importId;
+  final String status; // 'completed' | 'failed'
+  final int totalMessages;
+  final int processedMessages;
+  final int skippedOldMessages;
+  final int extractedCount;
+  final int duplicateCount;
+  final int rejectedCount; // low-confidence / unclear — saved as pending to review
+  final List<String> warnings;
+  final String? error;
+
+  ImportSummary({
+    required this.importId,
+    required this.status,
+    required this.totalMessages,
+    required this.processedMessages,
+    required this.skippedOldMessages,
+    required this.extractedCount,
+    required this.duplicateCount,
+    required this.rejectedCount,
+    required this.warnings,
+    required this.error,
+  });
+
+  bool get ok => status != 'failed';
+
+  bool get usedFallback =>
+      warnings.any((w) => w.toLowerCase().contains('fallback'));
+
+  factory ImportSummary.fromJson(Map<String, dynamic> json) {
+    final s = (json['summary'] as Map?)?.cast<String, dynamic>() ?? const {};
+    int count(String key) => (s[key] as num?)?.toInt() ?? 0;
+    return ImportSummary(
+      importId: json['importId'] as String?,
+      status: json['status'] as String? ?? 'completed',
+      totalMessages: count('totalMessages'),
+      processedMessages: count('processedMessages'),
+      skippedOldMessages: count('skippedOldMessages'),
+      extractedCount: count('extractedCount'),
+      duplicateCount: count('duplicateCount'),
+      rejectedCount: count('rejectedCount'),
+      warnings: (json['warnings'] as List<dynamic>? ?? const [])
+          .map((w) => w.toString())
+          .toList(),
+      error: json['error'] as String?,
+    );
+  }
+}

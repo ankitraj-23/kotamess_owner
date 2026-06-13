@@ -4,10 +4,10 @@ import '../models/extraction_result.dart';
 import '../services/database_service.dart';
 import '../services/extraction_service.dart';
 import '../services/whatsapp_import.dart';
-import '../widgets/confidence_badge.dart';
 
-/// Import WhatsApp chat (paste / .txt / .zip) → extract via backend → save as
-/// pending meal requests.
+/// Import WhatsApp chat (paste / .txt / .zip) → the server parses it, extracts
+/// requests, and saves them as pending `meal_requests`. The app just shows the
+/// returned summary and sends the owner to the Requests screen to review.
 class ChatImportScreen extends StatefulWidget {
   const ChatImportScreen({
     super.key,
@@ -29,9 +29,8 @@ class _ChatImportScreenState extends State<ChatImportScreen> {
   final _importer = const WhatsAppImporter();
 
   ImportedChat? _picked;
-  bool _extracting = false;
-  bool _saving = false;
-  ExtractionResult? _result;
+  bool _busy = false;
+  ImportSummary? _summary;
   String? _error;
 
   @override
@@ -50,7 +49,7 @@ class _ChatImportScreenState extends State<ChatImportScreen> {
       setState(() {
         _picked = chat;
         _input.text = chat.text;
-        _result = null;
+        _summary = null;
       });
     } on ImportException catch (e) {
       setState(() => _error = e.message);
@@ -62,7 +61,7 @@ class _ChatImportScreenState extends State<ChatImportScreen> {
   void _insertSample() {
     setState(() {
       _picked = null;
-      _result = null;
+      _summary = null;
       _error = null;
       _input.text =
           '12/06/26, 8:10 pm - Ravi Sharma: kal lunch nahi chahiye\n'
@@ -80,77 +79,41 @@ class _ChatImportScreenState extends State<ChatImportScreen> {
     setState(() {
       _input.clear();
       _picked = null;
-      _result = null;
+      _summary = null;
       _error = null;
     });
   }
 
-  Future<void> _extract() async {
+  Future<void> _import() async {
     final text = _input.text.trim();
     if (text.isEmpty) {
       setState(() => _error = 'Paste chat text or import a file first.');
       return;
     }
     setState(() {
-      _extracting = true;
+      _busy = true;
       _error = null;
-      _result = null;
+      _summary = null;
     });
     try {
-      final result = await widget.extractionService.extract(
+      final summary = await widget.extractionService.importChat(
         chatText: text,
         source: _hasFile ? 'file' : 'paste',
+        fileName: _picked?.fileName,
       );
-      setState(() => _result = result);
+      setState(() => _summary = summary);
     } on ExtractionException catch (e) {
       setState(() => _error = e.message);
     } catch (_) {
-      setState(() => _error = 'Extraction failed. Please try again.');
+      setState(() => _error = 'Import failed. Please try again.');
     } finally {
-      if (mounted) setState(() => _extracting = false);
-    }
-  }
-
-  Future<void> _save() async {
-    final result = _result;
-    if (result == null || result.requests.isEmpty) return;
-    setState(() {
-      _saving = true;
-      _error = null;
-    });
-    try {
-      final source = _hasFile ? 'file' : 'paste';
-      final importId = await widget.databaseService.saveImportedMessage(
-        rawText: _input.text.trim(),
-        source: source,
-      );
-      final saved = await widget.databaseService.saveExtractedMealRequests(
-        result.requests,
-        source: source,
-        importedMessageId: importId,
-      );
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Saved ${saved.length} pending request(s).')),
-      );
-      setState(() {
-        _result = null;
-        _input.clear();
-        _picked = null;
-      });
-      widget.onSavedGoToRequests();
-    } catch (_) {
-      if (mounted) {
-        setState(() => _error = 'Could not save requests. Please try again.');
-      }
-    } finally {
-      if (mounted) setState(() => _saving = false);
+      if (mounted) setState(() => _busy = false);
     }
   }
 
   @override
   Widget build(BuildContext context) {
-    final result = _result;
+    final summary = _summary;
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
@@ -165,7 +128,7 @@ class _ChatImportScreenState extends State<ChatImportScreen> {
                 const SizedBox(height: 6),
                 const Text(
                   'Upload WhatsApp .txt or .zip export, or paste the chat text. '
-                  'Requests are extracted on the server and saved as pending '
+                  'Requests are extracted and saved on the server as pending '
                   'for your review.',
                 ),
                 const SizedBox(height: 14),
@@ -174,17 +137,17 @@ class _ChatImportScreenState extends State<ChatImportScreen> {
                   runSpacing: 10,
                   children: [
                     FilledButton.icon(
-                      onPressed: _extracting || _saving ? null : _pickFile,
+                      onPressed: _busy ? null : _pickFile,
                       icon: const Icon(Icons.folder_zip_outlined),
                       label: const Text('Choose .txt or .zip'),
                     ),
                     OutlinedButton.icon(
-                      onPressed: _extracting || _saving ? null : _insertSample,
+                      onPressed: _busy ? null : _insertSample,
                       icon: const Icon(Icons.auto_awesome),
                       label: const Text('Insert sample'),
                     ),
                     OutlinedButton.icon(
-                      onPressed: _extracting || _saving ? null : _clear,
+                      onPressed: _busy ? null : _clear,
                       icon: const Icon(Icons.clear),
                       label: const Text('Clear'),
                     ),
@@ -211,15 +174,15 @@ class _ChatImportScreenState extends State<ChatImportScreen> {
                 SizedBox(
                   width: double.infinity,
                   child: FilledButton.icon(
-                    onPressed: _extracting || _saving ? null : _extract,
-                    icon: _extracting
+                    onPressed: _busy ? null : _import,
+                    icon: _busy
                         ? const SizedBox(
                             height: 18,
                             width: 18,
                             child: CircularProgressIndicator(strokeWidth: 2),
                           )
                         : const Icon(Icons.psychology_alt_outlined),
-                    label: Text(_extracting ? 'Extracting…' : 'Extract requests'),
+                    label: Text(_busy ? 'Importing…' : 'Import & extract'),
                   ),
                 ),
               ],
@@ -230,50 +193,86 @@ class _ChatImportScreenState extends State<ChatImportScreen> {
           const SizedBox(height: 12),
           _ErrorBanner(message: _error!),
         ],
-        if (result != null) ...[
+        if (summary != null) ...[
           const SizedBox(height: 16),
-          if (result.usedFallback) _WarningBanner(warnings: result.warnings),
-          if (result.requests.isEmpty)
+          if (summary.usedFallback) _WarningBanner(warnings: summary.warnings),
+          _SummaryCard(summary: summary),
+          if (summary.extractedCount == 0)
             const _EmptyExtraction()
           else ...[
-            Row(
-              children: [
-                Expanded(
-                  child: Text(
-                    'Extracted ${result.requests.length}',
-                    style: Theme.of(context)
-                        .textTheme
-                        .titleLarge
-                        ?.copyWith(fontWeight: FontWeight.w800),
-                  ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 10),
-            ...result.requests.map((r) => _ExtractedCard(request: r)),
             const SizedBox(height: 12),
             SizedBox(
               width: double.infinity,
               child: FilledButton.icon(
-                onPressed: _saving ? null : _save,
-                icon: _saving
-                    ? const SizedBox(
-                        height: 18,
-                        width: 18,
-                        child: CircularProgressIndicator(strokeWidth: 2),
-                      )
-                    : const Icon(Icons.save_outlined),
-                label: Text(
-                  _saving
-                      ? 'Saving…'
-                      : 'Save ${result.requests.length} as pending requests',
-                ),
+                onPressed: widget.onSavedGoToRequests,
+                icon: const Icon(Icons.fact_check_outlined),
+                label: Text('Review ${summary.extractedCount} request(s)'),
               ),
             ),
           ],
         ],
         const SizedBox(height: 24),
       ],
+    );
+  }
+}
+
+class _SummaryCard extends StatelessWidget {
+  final ImportSummary summary;
+  const _SummaryCard({required this.summary});
+
+  @override
+  Widget build(BuildContext context) {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'Import summary',
+              style: Theme.of(context)
+                  .textTheme
+                  .titleLarge
+                  ?.copyWith(fontWeight: FontWeight.w800),
+            ),
+            const SizedBox(height: 12),
+            _SummaryRow('Total messages', summary.totalMessages),
+            _SummaryRow('Processed messages', summary.processedMessages),
+            _SummaryRow('Skipped (older than 90 days)', summary.skippedOldMessages),
+            const Divider(height: 20),
+            _SummaryRow('Extracted requests', summary.extractedCount,
+                emphasize: true),
+            _SummaryRow('Possible duplicates', summary.duplicateCount),
+            _SummaryRow('Needs review (low confidence / unclear)',
+                summary.rejectedCount),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _SummaryRow extends StatelessWidget {
+  final String label;
+  final int value;
+  final bool emphasize;
+  const _SummaryRow(this.label, this.value, {this.emphasize = false});
+
+  @override
+  Widget build(BuildContext context) {
+    final weight = emphasize ? FontWeight.w800 : FontWeight.w500;
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 3),
+      child: Row(
+        children: [
+          Expanded(
+            child: Text(label, style: TextStyle(fontWeight: weight)),
+          ),
+          Text('$value',
+              style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 16)),
+        ],
+      ),
     );
   }
 }
@@ -309,71 +308,6 @@ class _FileInfo extends StatelessWidget {
           ),
         ],
       ),
-    );
-  }
-}
-
-class _ExtractedCard extends StatelessWidget {
-  final ExtractedRequest request;
-  const _ExtractedCard({required this.request});
-
-  @override
-  Widget build(BuildContext context) {
-    return Card(
-      margin: const EdgeInsets.only(bottom: 10),
-      child: Padding(
-        padding: const EdgeInsets.all(14),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                Expanded(
-                  child: Text(request.studentName,
-                      style: const TextStyle(
-                          fontWeight: FontWeight.w800, fontSize: 16)),
-                ),
-                ConfidenceBadge(confidence: request.confidence),
-              ],
-            ),
-            const SizedBox(height: 6),
-            Wrap(
-              spacing: 6,
-              runSpacing: 6,
-              children: [
-                _Tag(request.requestTypeLabel),
-                if (request.mealType != 'none') _Tag(request.mealTypeLabel),
-                _Tag(request.requestDate ?? request.dateLabel),
-              ],
-            ),
-            const SizedBox(height: 8),
-            Text('“${request.originalMessage}”',
-                style: TextStyle(color: Colors.grey.shade800)),
-            if (request.reason.isNotEmpty) ...[
-              const SizedBox(height: 6),
-              Text(request.reason,
-                  style: TextStyle(color: Colors.grey.shade600, fontSize: 12)),
-            ],
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-class _Tag extends StatelessWidget {
-  final String text;
-  const _Tag(this.text);
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-      decoration: BoxDecoration(
-        color: const Color(0xFFE2E8F0),
-        borderRadius: BorderRadius.circular(999),
-      ),
-      child: Text(text, style: const TextStyle(fontSize: 12)),
     );
   }
 }
