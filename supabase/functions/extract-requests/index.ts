@@ -236,7 +236,9 @@ serve(async (req: Request): Promise<Response> => {
     }
 
     // --- Resolve customers (students) ----------------------------------
-    const studentIds = await resolveStudentIds(
+    // `studentIds` holds only confident links; `ambiguousKeys` are senders that
+    // matched >1 active customer — those stay unlinked (student_id = null).
+    const { ids: studentIds, ambiguous: ambiguousKeys } = await resolveStudentIds(
       supabase,
       ownerId,
       requests.map((r) => r.studentName),
@@ -257,6 +259,7 @@ serve(async (req: Request): Promise<Response> => {
 
     const rows = requests.map((r, i) => {
       const sKey = nameKey(r.studentName);
+      const isAmbiguous = ambiguousKeys.has(sKey);
       const key = dupKey(sKey, r);
       let duplicateStatus = "unique";
 
@@ -281,9 +284,9 @@ serve(async (req: Request): Promise<Response> => {
         meal_type: r.mealType,
         request_date: r.requestDate,
         date_label: r.dateLabel,
-        status: "pending", // confidence<0.6 / unclear are also pending (needs review)
+        status: "pending", // confidence<0.6 / unclear / ambiguous are also pending (needs review)
         confidence: r.confidence,
-        reason: r.reason,
+        reason: isAmbiguous ? withAmbiguityNote(r.reason) : r.reason,
         source,
         import_id: importId,
         message_id: messageIdByText.get(r.originalMessage) ?? null,
@@ -397,27 +400,107 @@ function nameKey(raw: string): string {
   return cleaned.split(" ").filter((t) => !NAME_NOISE.has(t)).join(" ");
 }
 
+// Normalize a sender string to a 10-digit Indian phone "core", or "" when the
+// string isn't phone-shaped. Lets an unsaved-contact sender (e.g. a raw number)
+// match a student's stored phone. Names like "Amit" reduce to "" (no digits).
+function phoneKey(raw: string): string {
+  let d = (raw ?? "").replace(/\D/g, "");
+  if (d.length === 12 && d.startsWith("91")) d = d.slice(2);
+  else if (d.length === 11 && d.startsWith("0")) d = d.slice(1);
+  return d.length === 10 ? d : "";
+}
+
+// A student is matchable only when active. `status` (active/inactive/paused) is
+// authoritative when present; fall back to the legacy `active` boolean.
+function isActiveStudent(s: { status?: unknown; active?: unknown }): boolean {
+  if (typeof s.status === "string" && s.status !== "") return s.status === "active";
+  return s.active !== false;
+}
+
+function pushId(map: Map<string, string[]>, key: string, id: string): void {
+  const arr = map.get(key);
+  if (arr) {
+    if (!arr.includes(id)) arr.push(id);
+  } else {
+    map.set(key, [id]);
+  }
+}
+
+// Shown in meal_requests.reason when a sender could be one of several active
+// customers. The request stays pending + unlinked so the owner picks in review.
+const STUDENT_AMBIGUOUS_NOTE =
+  "Multiple matching customers — left unlinked; choose the customer in review.";
+
+function withAmbiguityNote(reason: string): string {
+  const base = (reason ?? "").trim();
+  return base === "" ? STUDENT_AMBIGUOUS_NOTE : `${base} | ${STUDENT_AMBIGUOUS_NOTE}`;
+}
+
+interface StudentResolution {
+  ids: Map<string, string>; // nameKey -> confidently linked student id
+  ambiguous: Set<string>; // nameKey that matched >1 active student (left null)
+}
+
+// Production-safe customer (students) resolution.
+//
+// Priority per distinct sender:
+//   1. Exact phone match  -> link iff exactly one active student has that phone.
+//   2. Exact alias match  -> link iff the alias maps to exactly one active student.
+//   3. Unique name match  -> link iff exactly one active student shares the name.
+//   4. >1 active match at any tier -> AMBIGUOUS: student_id stays null, the
+//      sender name is preserved on the request, status stays pending. We never
+//      silently pick the first match.
+//   5. No match at all    -> create a new active student (existing safe behaviour).
+//      If a non-active student (inactive/paused) already owns the name/alias we
+//      do NOT create a duplicate; we leave it unlinked for manual review.
+//
+// Matching is scoped to ACTIVE students; the create-guard uses students of any
+// status so we never spawn a duplicate of an existing (even inactive) customer.
+//
+// Test cases (behaviour this function guarantees):
+//   1. One active "Amit"  -> "Amit: ..." links to that student.
+//   2. Two active "Amit"s -> "Amit: ..." does NOT link (student_id = null,
+//      ambiguous), no new "Amit" student is created.
+//   3. Sender phone matches exactly one active student's phone -> phone wins,
+//      even if names differ.
+//   4. Alias maps to exactly one active student -> links via alias.
+//   5. Alias OR name maps to >1 active student -> no auto-link (ambiguous).
 async function resolveStudentIds(
   supabase: SupabaseClient,
   ownerId: string,
   names: string[],
-): Promise<Map<string, string>> {
-  const distinct = new Map<string, string>(); // key -> display name
+): Promise<StudentResolution> {
+  const ids = new Map<string, string>();
+  const ambiguous = new Set<string>();
+
+  const distinct = new Map<string, string>(); // key -> display name (first seen)
   for (const n of names) {
     const key = nameKey(n);
     if (key === "" || key === "unknown") continue;
     if (!distinct.has(key)) distinct.set(key, n.trim());
   }
-  const result = new Map<string, string>();
-  if (distinct.size === 0) return result;
+  if (distinct.size === 0) return { ids, ambiguous };
 
-  const { data: existing } = await supabase
+  const { data: students } = await supabase
     .from("students")
-    .select("id, name")
+    .select("id, name, phone, status, active")
     .eq("owner_id", ownerId);
-  for (const s of existing ?? []) {
-    const k = nameKey((s.name as string) ?? "");
-    if (k && s.id) result.set(k, s.id as string);
+
+  const activeByName = new Map<string, string[]>();
+  const activeByPhone = new Map<string, string[]>();
+  const anyByName = new Map<string, string[]>(); // any status (create-guard)
+  const activeIds = new Set<string>();
+
+  for (const s of students ?? []) {
+    const id = s.id as string;
+    if (!id) continue;
+    const nk = nameKey((s.name as string) ?? "");
+    if (nk) pushId(anyByName, nk, id);
+    if (!isActiveStudent(s)) continue;
+    activeIds.add(id);
+    if (nk) pushId(activeByName, nk, id);
+    const pk = phoneKey((s.phone as string) ?? "");
+    if (pk) pushId(activeByPhone, pk, id);
   }
 
   // Aliases let alternate spellings resolve to the same student.
@@ -425,12 +508,50 @@ async function resolveStudentIds(
     .from("student_aliases")
     .select("student_id, normalized_alias")
     .eq("owner_id", ownerId);
+  const activeByAlias = new Map<string, Set<string>>();
+  const anyAlias = new Set<string>(); // any status (create-guard)
   for (const a of aliases ?? []) {
-    const k = (a.normalized_alias as string) ?? "";
-    if (k && a.student_id && !result.has(k)) result.set(k, a.student_id as string);
+    const ak = (a.normalized_alias as string) ?? "";
+    const sid = a.student_id as string;
+    if (!ak || !sid) continue;
+    anyAlias.add(ak);
+    if (activeIds.has(sid)) {
+      const set = activeByAlias.get(ak) ?? new Set<string>();
+      set.add(sid);
+      activeByAlias.set(ak, set);
+    }
   }
 
-  const toCreate = [...distinct.entries()].filter(([k]) => !result.has(k));
+  const toCreate: Array<[string, string]> = [];
+
+  for (const [key, display] of distinct.entries()) {
+    // 1. Phone — only when the sender is phone-shaped.
+    const pk = phoneKey(display);
+    if (pk) {
+      const ph = activeByPhone.get(pk);
+      if (ph && ph.length === 1) { ids.set(key, ph[0]); continue; }
+      if (ph && ph.length > 1) { ambiguous.add(key); continue; }
+    }
+
+    // 2. Alias — exactly one active student.
+    const al = activeByAlias.get(key);
+    if (al && al.size === 1) { ids.set(key, [...al][0]); continue; }
+    if (al && al.size > 1) { ambiguous.add(key); continue; }
+
+    // 3. Unique normalized name — exactly one active student.
+    const nm = activeByName.get(key);
+    if (nm && nm.length === 1) { ids.set(key, nm[0]); continue; }
+    if (nm && nm.length > 1) { ambiguous.add(key); continue; }
+
+    // 4. No active match. Create only when nothing (any status) owns this
+    //    name/alias, so we never duplicate an existing customer.
+    if ((anyByName.get(key)?.length ?? 0) === 0 && !anyAlias.has(key)) {
+      toCreate.push([key, display]);
+    } else {
+      ambiguous.add(key); // inactive/paused-only match -> review manually
+    }
+  }
+
   if (toCreate.length > 0) {
     const { data: inserted, error } = await supabase
       .from("students")
@@ -439,10 +560,10 @@ async function resolveStudentIds(
     if (error) throw error;
     for (const s of inserted ?? []) {
       const k = nameKey((s.name as string) ?? "");
-      if (k && s.id) result.set(k, s.id as string);
+      if (k && s.id) ids.set(k, s.id as string);
     }
   }
-  return result;
+  return { ids, ambiguous };
 }
 
 // ---------------------------------------------------------------------------

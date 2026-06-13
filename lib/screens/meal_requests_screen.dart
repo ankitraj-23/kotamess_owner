@@ -122,33 +122,17 @@ class MealRequestsScreenState extends State<MealRequestsScreen> {
 
   /// Opens a small dialog to add/edit the owner's private note on a request.
   Future<void> _addNote(MealRequest r) async {
-    final controller = TextEditingController(text: r.ownerNote);
     final note = await showDialog<String>(
       context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Owner note'),
-        content: TextField(
-          controller: controller,
-          autofocus: true,
-          minLines: 1,
-          maxLines: 4,
-          decoration: const InputDecoration(
-            hintText: 'Private note for this request',
-          ),
-        ),
-        actions: [
-          TextButton(
-              onPressed: () => Navigator.pop(context),
-              child: const Text('Cancel')),
-          FilledButton(
-              onPressed: () => Navigator.pop(context, controller.text.trim()),
-              child: const Text('Save')),
-        ],
-      ),
+      builder: (_) => _OwnerNoteDialog(initial: r.ownerNote),
     );
-    controller.dispose();
+    if (!mounted) return;
+    // Cancelled or dismissed: leave the request untouched.
     if (note == null) return;
-    await _guard(() => widget.databaseService.addOwnerNote(r.id, note), 'Note saved');
+    // No actual change: don't fire an unnecessary update.
+    if (note == r.ownerNote.trim()) return;
+    await _guard(
+        () => widget.databaseService.addOwnerNote(r.id, note), 'Note saved');
   }
 
   Future<void> _approveSelected() async {
@@ -334,6 +318,54 @@ class MealRequestsScreenState extends State<MealRequestsScreen> {
   }
 }
 
+/// Small dialog that owns its [TextEditingController] so the controller is
+/// only disposed once this widget's element is fully unmounted — never while
+/// the dialog route is still mounted/animating out. Pops the trimmed note text
+/// on Save, or null when cancelled/dismissed.
+class _OwnerNoteDialog extends StatefulWidget {
+  const _OwnerNoteDialog({required this.initial});
+
+  final String initial;
+
+  @override
+  State<_OwnerNoteDialog> createState() => _OwnerNoteDialogState();
+}
+
+class _OwnerNoteDialogState extends State<_OwnerNoteDialog> {
+  late final TextEditingController _controller =
+      TextEditingController(text: widget.initial);
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Owner note'),
+      content: TextField(
+        controller: _controller,
+        autofocus: true,
+        minLines: 1,
+        maxLines: 4,
+        decoration: const InputDecoration(
+          hintText: 'Private note for this request',
+        ),
+      ),
+      actions: [
+        TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cancel')),
+        FilledButton(
+            onPressed: () => Navigator.pop(context, _controller.text.trim()),
+            child: const Text('Save')),
+      ],
+    );
+  }
+}
+
 class _RequestCard extends StatelessWidget {
   const _RequestCard({
     required this.request,
@@ -418,6 +450,7 @@ class _RequestCard extends StatelessWidget {
                 if (request.mealType != 'none') _Tag(request.mealTypeLabel),
                 _Tag(request.dateDisplay),
                 _StatusTag(status: request.status),
+                if (request.studentId == null) const _Tag('Not linked'),
                 if (ledgerLinked) const _Tag('Ledger linked'),
               ],
             ),
