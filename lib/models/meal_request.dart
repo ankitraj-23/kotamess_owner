@@ -16,8 +16,10 @@ class MealRequest {
   String status;
   final double confidence;
   String reason;
+  String ownerNote;
   final String source;
   final DateTime? createdAt;
+  final DateTime? completedAt;
 
   MealRequest({
     required this.id,
@@ -32,8 +34,10 @@ class MealRequest {
     required this.status,
     required this.confidence,
     required this.reason,
+    this.ownerNote = '',
     required this.source,
     required this.createdAt,
+    this.completedAt,
   });
 
   factory MealRequest.fromJson(Map<String, dynamic> json) {
@@ -50,8 +54,10 @@ class MealRequest {
       status: json['status'] as String? ?? 'pending',
       confidence: (json['confidence'] as num?)?.toDouble() ?? 0.0,
       reason: json['reason'] as String? ?? '',
+      ownerNote: json['owner_note'] as String? ?? '',
       source: json['source'] as String? ?? 'paste',
       createdAt: DateTime.tryParse(json['created_at'] as String? ?? ''),
+      completedAt: DateTime.tryParse(json['completed_at'] as String? ?? ''),
     );
   }
 
@@ -64,6 +70,7 @@ class MealRequest {
       'request_date': requestDate,
       'date_label': dateLabel,
       'reason': reason.trim(),
+      'owner_note': ownerNote.trim(),
     };
   }
 
@@ -96,7 +103,15 @@ class MealRequestVocab {
 
   static const mealTypes = <String>['lunch', 'dinner', 'both', 'none'];
 
-  static const statuses = <String>['pending', 'approved', 'rejected'];
+  /// Lifecycle states. `pending` == needs review, `approved` == confirmed /
+  /// scheduled; `completed`/`cancelled` are owner-driven terminal states.
+  static const statuses = <String>[
+    'pending',
+    'approved',
+    'completed',
+    'cancelled',
+    'rejected',
+  ];
 
   static String typeLabel(String type) {
     switch (type) {
@@ -137,11 +152,15 @@ class MealRequestVocab {
   static String statusLabel(String status) {
     switch (status) {
       case 'approved':
-        return 'Approved';
+        return 'Confirmed';
+      case 'completed':
+        return 'Completed';
+      case 'cancelled':
+        return 'Cancelled';
       case 'rejected':
         return 'Rejected';
       default:
-        return 'Pending';
+        return 'Needs review';
     }
   }
 }

@@ -1,10 +1,13 @@
 import 'package:supabase_flutter/supabase_flutter.dart';
 
+import '../models/audit_log.dart';
 import '../models/daily_adjustment.dart';
 import '../models/daily_summary.dart';
 import '../models/dashboard.dart';
 import '../models/extraction_result.dart';
+import '../models/kitchen_summary.dart';
 import '../models/ledger_entry.dart';
+import '../models/meal_plan.dart';
 import '../models/meal_request.dart';
 import '../models/student.dart';
 import 'money_utils.dart';
@@ -27,6 +30,51 @@ class DatabaseService {
       throw StateError('No authenticated session.');
     }
     return user.id;
+  }
+
+  // --- Audit log ----------------------------------------------------------
+
+  /// Appends an entry to `audit_logs` for an important action. Best-effort:
+  /// a failed audit write never blocks (or rolls back) the primary action.
+  Future<void> _writeAudit({
+    required String entityType,
+    String? entityId,
+    required String action,
+    Map<String, dynamic>? oldData,
+    Map<String, dynamic>? newData,
+  }) async {
+    try {
+      final ownerId = getCurrentOwnerId();
+      await _client.from('audit_logs').insert({
+        'owner_id': ownerId,
+        'actor_id': ownerId,
+        'entity_type': entityType,
+        if (entityId != null) 'entity_id': entityId,
+        'action': action,
+        if (oldData != null) 'old_data': oldData,
+        if (newData != null) 'new_data': newData,
+      });
+    } catch (_) {
+      // Audit logging is best-effort; swallow so the user action still succeeds.
+    }
+  }
+
+  /// Recent audit entries, newest first. Optionally scoped to one entity (e.g.
+  /// a customer's change history).
+  Future<List<AuditLog>> fetchAuditLogs({
+    String? entityType,
+    String? entityId,
+    int limit = 20,
+  }) async {
+    final ownerId = getCurrentOwnerId();
+    var query = _client.from('audit_logs').select().eq('owner_id', ownerId);
+    if (entityType != null) query = query.eq('entity_type', entityType);
+    if (entityId != null) query = query.eq('entity_id', entityId);
+    final rows =
+        await query.order('created_at', ascending: false).limit(limit);
+    return rows
+        .map((e) => AuditLog.fromJson(Map<String, dynamic>.from(e)))
+        .toList();
   }
 
   // --- Imported messages --------------------------------------------------
@@ -108,24 +156,46 @@ class DatabaseService {
         .toList();
   }
 
-  /// Approves a request and, for payment/dues requests, auto-creates a single
-  /// linked ledger entry. Returns true when a ledger entry was created (so the
-  /// UI can show "Approved and added to Ledger").
+  /// Approves ("confirms") a request and, for payment/dues requests,
+  /// auto-creates a single linked ledger entry. Returns true when a ledger
+  /// entry was created (so the UI can show "Confirmed and added to Ledger").
   Future<bool> approveMealRequest(String id) async {
-    final ownerId = getCurrentOwnerId();
-    final row = await _client
-        .from('meal_requests')
-        .update({'status': 'approved'})
-        .eq('id', id)
-        .eq('owner_id', ownerId)
-        .select()
-        .maybeSingle();
-    if (row == null) return false;
-    final req = MealRequest.fromJson(Map<String, dynamic>.from(row));
+    final req = await _updateRequestStatus(id, 'approved', 'confirm');
+    if (req == null) return false;
     return _maybeCreateLedgerForApproved(req);
   }
 
-  Future<void> rejectMealRequest(String id) => _setStatus(id, 'rejected');
+  Future<void> rejectMealRequest(String id) =>
+      _updateRequestStatus(id, 'rejected', 'reject');
+
+  /// Marks a request as completed (terminal). Records `completed_at`.
+  Future<void> markRequestCompleted(String id) => _updateRequestStatus(
+        id,
+        'completed',
+        'complete',
+        extra: {'completed_at': DateTime.now().toUtc().toIso8601String()},
+      );
+
+  /// Cancels a request (terminal owner action; distinct from rejecting an
+  /// extracted item that was wrong).
+  Future<void> cancelRequest(String id) =>
+      _updateRequestStatus(id, 'cancelled', 'cancel');
+
+  /// Adds/replaces the owner's private note on a request and audits it.
+  Future<void> addOwnerNote(String id, String note) async {
+    final ownerId = getCurrentOwnerId();
+    await _client
+        .from('meal_requests')
+        .update({'owner_note': note.trim()})
+        .eq('id', id)
+        .eq('owner_id', ownerId);
+    await _writeAudit(
+      entityType: 'meal_request',
+      entityId: id,
+      action: 'note',
+      newData: {'owner_note': note.trim()},
+    );
+  }
 
   Future<int> approveMany(List<String> ids) async {
     if (ids.isEmpty) return 0;
@@ -136,12 +206,53 @@ class DatabaseService {
         .inFilter('id', ids)
         .eq('owner_id', ownerId)
         .select();
-    // Auto-create ledger entries for any approved payment/dues requests.
+    // Auto-create ledger entries + audit each approved request.
     for (final row in updated) {
       final req = MealRequest.fromJson(Map<String, dynamic>.from(row));
       await _maybeCreateLedgerForApproved(req);
+      await _writeAudit(
+        entityType: 'meal_request',
+        entityId: req.id,
+        action: 'confirm',
+        newData: {'status': 'approved', 'student_name': req.studentName},
+      );
     }
     return updated.length;
+  }
+
+  /// Shared status transition: reads the prior status (for the audit trail),
+  /// updates, audits, and returns the refreshed request. Returns null if no
+  /// matching owner-scoped row was found.
+  Future<MealRequest?> _updateRequestStatus(
+    String id,
+    String status,
+    String action, {
+    Map<String, dynamic>? extra,
+  }) async {
+    final ownerId = getCurrentOwnerId();
+    final before = await _client
+        .from('meal_requests')
+        .select('status')
+        .eq('id', id)
+        .eq('owner_id', ownerId)
+        .maybeSingle();
+    final row = await _client
+        .from('meal_requests')
+        .update({'status': status, ...?extra})
+        .eq('id', id)
+        .eq('owner_id', ownerId)
+        .select()
+        .maybeSingle();
+    if (row == null) return null;
+    final req = MealRequest.fromJson(Map<String, dynamic>.from(row));
+    await _writeAudit(
+      entityType: 'meal_request',
+      entityId: id,
+      action: action,
+      oldData: before == null ? null : {'status': before['status']},
+      newData: {'status': status, 'student_name': req.studentName},
+    );
+    return req;
   }
 
   /// meal_request ids (for this owner) that already have a linked ledger entry,
@@ -224,14 +335,22 @@ class DatabaseService {
 
   Future<MealRequest> updateMealRequest(MealRequest request) async {
     final ownerId = getCurrentOwnerId();
+    final update = request.toEditableUpdate();
     final row = await _client
         .from('meal_requests')
-        .update(request.toEditableUpdate())
+        .update(update)
         .eq('id', request.id)
         .eq('owner_id', ownerId)
         .select()
         .single();
-    return MealRequest.fromJson(Map<String, dynamic>.from(row));
+    final updated = MealRequest.fromJson(Map<String, dynamic>.from(row));
+    await _writeAudit(
+      entityType: 'meal_request',
+      entityId: request.id,
+      action: 'edit',
+      newData: update,
+    );
+    return updated;
   }
 
   Future<void> deleteMealRequest(String id) async {
@@ -241,15 +360,11 @@ class DatabaseService {
         .delete()
         .eq('id', id)
         .eq('owner_id', ownerId);
-  }
-
-  Future<void> _setStatus(String id, String status) async {
-    final ownerId = getCurrentOwnerId();
-    await _client
-        .from('meal_requests')
-        .update({'status': status})
-        .eq('id', id)
-        .eq('owner_id', ownerId);
+    await _writeAudit(
+      entityType: 'meal_request',
+      entityId: id,
+      action: 'delete',
+    );
   }
 
   // --- Students -----------------------------------------------------------
@@ -492,6 +607,348 @@ class DatabaseService {
         .eq('owner_id', ownerId);
   }
 
+  // --- Customers (stored in the `students` table) -------------------------
+
+  /// All customers for this owner, with full lifecycle fields. Optional
+  /// [status] filter ('active'|'paused'|'inactive') and name/phone [search].
+  Future<List<Student>> fetchCustomers({String? status, String? search}) async {
+    final ownerId = getCurrentOwnerId();
+    var query = _client.from('students').select().eq('owner_id', ownerId);
+    if (status != null && status != 'all') {
+      query = query.eq('status', status);
+    }
+    final term = search?.trim() ?? '';
+    if (term.isNotEmpty) {
+      query = query.or('name.ilike.%$term%,phone.ilike.%$term%');
+    }
+    final rows = await query.order('name');
+    return rows
+        .map((e) => Student.fromJson(Map<String, dynamic>.from(e)))
+        .toList();
+  }
+
+  /// Customer counts grouped by status, for the dashboard tallies.
+  Future<Map<String, int>> fetchCustomerStatusCounts() async {
+    final ownerId = getCurrentOwnerId();
+    final rows =
+        await _client.from('students').select('status').eq('owner_id', ownerId);
+    final counts = <String, int>{'active': 0, 'paused': 0, 'inactive': 0};
+    for (final r in rows) {
+      final s = r['status'] as String? ?? 'active';
+      counts[s] = (counts[s] ?? 0) + 1;
+    }
+    return counts;
+  }
+
+  /// Creates a customer with full details (distinct from the thin
+  /// [createStudent] used by the import/link flow).
+  Future<Student> createCustomer({
+    required String name,
+    String phone = '',
+    String roomOrAddress = '',
+    String status = 'active',
+    String notes = '',
+    String? joinedAt,
+  }) async {
+    final ownerId = getCurrentOwnerId();
+    final draft = Student(
+      id: '',
+      name: name,
+      phone: phone,
+      roomOrAddress: roomOrAddress,
+      status: status,
+      notes: notes,
+      // Default the join date to today when the caller doesn't supply one.
+      joinedAt: joinedAt ?? _dateStr(DateTime.now()),
+    );
+    final row = await _client
+        .from('students')
+        .insert({'owner_id': ownerId, ...draft.toWritable()})
+        .select()
+        .single();
+    final created = Student.fromJson(Map<String, dynamic>.from(row));
+    await _writeAudit(
+      entityType: 'customer',
+      entityId: created.id,
+      action: 'create',
+      newData: {'name': created.name, 'status': created.status},
+    );
+    return created;
+  }
+
+  /// Updates an existing customer's editable fields.
+  Future<Student> updateCustomer(Student customer) async {
+    final ownerId = getCurrentOwnerId();
+    final row = await _client
+        .from('students')
+        .update(customer.toWritable())
+        .eq('id', customer.id)
+        .eq('owner_id', ownerId)
+        .select()
+        .single();
+    final updated = Student.fromJson(Map<String, dynamic>.from(row));
+    await _writeAudit(
+      entityType: 'customer',
+      entityId: customer.id,
+      action: 'update',
+      newData: {'name': updated.name, 'status': updated.status},
+    );
+    return updated;
+  }
+
+  /// Marks a customer active / paused / inactive, keeping the legacy `active`
+  /// boolean in sync, and audits the transition.
+  Future<void> setCustomerStatus(String id, String status) async {
+    final ownerId = getCurrentOwnerId();
+    final before = await _client
+        .from('students')
+        .select('status')
+        .eq('id', id)
+        .eq('owner_id', ownerId)
+        .maybeSingle();
+    await _client
+        .from('students')
+        .update({'status': status, 'active': status == 'active'})
+        .eq('id', id)
+        .eq('owner_id', ownerId);
+    final action = switch (status) {
+      'paused' => 'pause',
+      'active' => 'resume',
+      _ => 'status_change',
+    };
+    await _writeAudit(
+      entityType: 'customer',
+      entityId: id,
+      action: action,
+      oldData: before == null ? null : {'status': before['status']},
+      newData: {'status': status},
+    );
+  }
+
+  /// A single customer's request history (newest first).
+  Future<List<MealRequest>> fetchCustomerRequests(String studentId) async {
+    final ownerId = getCurrentOwnerId();
+    final rows = await _client
+        .from('meal_requests')
+        .select()
+        .eq('owner_id', ownerId)
+        .eq('student_id', studentId)
+        .order('created_at', ascending: false);
+    return rows
+        .map((e) => MealRequest.fromJson(Map<String, dynamic>.from(e)))
+        .toList();
+  }
+
+  // --- Meal plans ---------------------------------------------------------
+
+  Future<List<MealPlan>> fetchMealPlans({bool activeOnly = false}) async {
+    final ownerId = getCurrentOwnerId();
+    var query = _client.from('meal_plans').select().eq('owner_id', ownerId);
+    if (activeOnly) query = query.eq('is_active', true);
+    final rows = await query.order('created_at', ascending: false);
+    return rows
+        .map((e) => MealPlan.fromJson(Map<String, dynamic>.from(e)))
+        .toList();
+  }
+
+  Future<MealPlan> createMealPlan(MealPlan plan) async {
+    final ownerId = getCurrentOwnerId();
+    final row = await _client
+        .from('meal_plans')
+        .insert({'owner_id': ownerId, ...plan.toWritable()})
+        .select()
+        .single();
+    final created = MealPlan.fromJson(Map<String, dynamic>.from(row));
+    await _writeAudit(
+      entityType: 'meal_plan',
+      entityId: created.id,
+      action: 'create',
+      newData: {'name': created.name},
+    );
+    return created;
+  }
+
+  Future<MealPlan> updateMealPlan(MealPlan plan) async {
+    final ownerId = getCurrentOwnerId();
+    final row = await _client
+        .from('meal_plans')
+        .update(plan.toWritable())
+        .eq('id', plan.id)
+        .eq('owner_id', ownerId)
+        .select()
+        .single();
+    final updated = MealPlan.fromJson(Map<String, dynamic>.from(row));
+    await _writeAudit(
+      entityType: 'meal_plan',
+      entityId: plan.id,
+      action: 'update',
+      newData: {'name': updated.name},
+    );
+    return updated;
+  }
+
+  Future<void> deleteMealPlan(String id) async {
+    final ownerId = getCurrentOwnerId();
+    await _client
+        .from('meal_plans')
+        .delete()
+        .eq('id', id)
+        .eq('owner_id', ownerId);
+    await _writeAudit(entityType: 'meal_plan', entityId: id, action: 'delete');
+  }
+
+  // --- Customer meal plans (assignments) ----------------------------------
+
+  /// The customer's current active plan (with the plan joined in), or null.
+  Future<CustomerMealPlan?> fetchActiveCustomerPlan(String studentId) async {
+    final ownerId = getCurrentOwnerId();
+    final row = await _client
+        .from('customer_meal_plans')
+        .select('*, meal_plans(*)')
+        .eq('owner_id', ownerId)
+        .eq('student_id', studentId)
+        .eq('is_active', true)
+        .maybeSingle();
+    if (row == null) return null;
+    return CustomerMealPlan.fromJson(Map<String, dynamic>.from(row));
+  }
+
+  /// Assigns [mealPlanId] to a customer as their active plan, ending any
+  /// previous active assignment first (the unique partial index allows only
+  /// one active plan per customer).
+  Future<void> assignMealPlan({
+    required String studentId,
+    required String mealPlanId,
+    String? startDate,
+  }) async {
+    final ownerId = getCurrentOwnerId();
+    await _endActiveCustomerPlans(ownerId, studentId);
+    await _client.from('customer_meal_plans').insert({
+      'owner_id': ownerId,
+      'student_id': studentId,
+      'meal_plan_id': mealPlanId,
+      'start_date': startDate ?? _dateStr(DateTime.now()),
+      'is_active': true,
+    });
+    await _writeAudit(
+      entityType: 'customer_meal_plan',
+      entityId: studentId,
+      action: 'assign_plan',
+      newData: {'meal_plan_id': mealPlanId},
+    );
+  }
+
+  /// Ends the customer's active plan without assigning a new one.
+  Future<void> endCustomerPlan(String studentId) async {
+    final ownerId = getCurrentOwnerId();
+    await _endActiveCustomerPlans(ownerId, studentId);
+    await _writeAudit(
+      entityType: 'customer_meal_plan',
+      entityId: studentId,
+      action: 'update',
+      newData: {'is_active': false},
+    );
+  }
+
+  Future<void> _endActiveCustomerPlans(String ownerId, String studentId) async {
+    await _client
+        .from('customer_meal_plans')
+        .update({'is_active': false, 'end_date': _dateStr(DateTime.now())})
+        .eq('owner_id', ownerId)
+        .eq('student_id', studentId)
+        .eq('is_active', true);
+  }
+
+  // --- Kitchen summary ----------------------------------------------------
+
+  /// Expected meal headcounts derived from active customers' active meal plans.
+  /// Returns (fromPlans, breakfast, lunch, dinner): `fromPlans` is false when
+  /// there is no plan data at all, so callers can fall back to base counts.
+  Future<({bool fromPlans, int breakfast, int lunch, int dinner})>
+      _expectedFromPlans(String ownerId) async {
+    final rows = await _client
+        .from('customer_meal_plans')
+        .select(
+            'is_active, meal_plans(breakfast_enabled,lunch_enabled,dinner_enabled), students(status)')
+        .eq('owner_id', ownerId)
+        .eq('is_active', true);
+    var breakfast = 0, lunch = 0, dinner = 0;
+    var any = false;
+    for (final row in rows) {
+      final student = row['students'];
+      final status = student is Map ? student['status'] as String? : null;
+      // Only active customers contribute to the expected kitchen count.
+      if (status != null && status != 'active') continue;
+      final plan = row['meal_plans'];
+      if (plan is! Map) continue;
+      any = true;
+      if (plan['breakfast_enabled'] == true) breakfast++;
+      if (plan['lunch_enabled'] == true) lunch++;
+      if (plan['dinner_enabled'] == true) dinner++;
+    }
+    return (fromPlans: any, breakfast: breakfast, lunch: lunch, dinner: dinner);
+  }
+
+  /// Builds the breakfast/lunch/dinner kitchen plan for [date]: expected from
+  /// active customer meal plans (fallback to base lunch/dinner counts), minus
+  /// confirmed cancellations, plus confirmed extras.
+  Future<KitchenSummary> fetchKitchenSummary({
+    required String date,
+    required int baseLunch,
+    required int baseDinner,
+  }) async {
+    final ownerId = getCurrentOwnerId();
+    final expected = await _expectedFromPlans(ownerId);
+    final rows = await _client
+        .from('meal_requests')
+        .select()
+        .eq('owner_id', ownerId)
+        .eq('status', 'approved');
+    final approved = rows
+        .map((e) => MealRequest.fromJson(Map<String, dynamic>.from(e)))
+        .toList();
+    return _composeKitchen(
+      date: date,
+      expected: expected,
+      baseLunch: baseLunch,
+      baseDinner: baseDinner,
+      approved: approved,
+    );
+  }
+
+  /// Pure assembly of a [KitchenSummary] from already-fetched inputs, so the
+  /// dashboard can reuse one approved-request fetch across today + tomorrow.
+  KitchenSummary _composeKitchen({
+    required String date,
+    required ({bool fromPlans, int breakfast, int lunch, int dinner}) expected,
+    required int baseLunch,
+    required int baseDinner,
+    required List<MealRequest> approved,
+  }) {
+    final expB = expected.fromPlans ? expected.breakfast : 0;
+    final expL = expected.fromPlans ? expected.lunch : baseLunch;
+    final expD = expected.fromPlans ? expected.dinner : baseDinner;
+
+    // Reuse the daily counting rules for cancellations/additions on this date.
+    // Breakfast is informational only (requests don't model it yet).
+    final ds = DailySummary.compute(
+      date: date,
+      baseLunch: 0,
+      baseDinner: 0,
+      approvedRequests: approved,
+      adjustments: const [],
+    );
+    return KitchenSummary(
+      date: date,
+      fromPlans: expected.fromPlans,
+      breakfast: MealCount(expected: expB),
+      lunch: MealCount(
+          expected: expL, cancelled: ds.lunchCancelled, extra: ds.lunchAdded),
+      dinner: MealCount(
+          expected: expD, cancelled: ds.dinnerCancelled, extra: ds.dinnerAdded),
+    );
+  }
+
   // --- Dashboard ----------------------------------------------------------
 
   /// Aggregates the Home dashboard: today's final counts, pending/approved
@@ -514,6 +971,7 @@ class DatabaseService {
 
     final approved = requests.where((r) => r.status == 'approved').toList();
     final pendingCount = requests.where((r) => r.status == 'pending').length;
+    final scheduledCount = approved.length;
 
     final todayDate = DateTime.parse(today);
     final approvedTodayCount = approved.where((r) {
@@ -528,6 +986,25 @@ class DatabaseService {
       baseDinner: baseDinner,
       approvedRequests: approved,
       adjustments: adjustments,
+    );
+
+    // Customer status tallies + today/tomorrow kitchen plan.
+    final customerCounts = await fetchCustomerStatusCounts();
+    final expected = await _expectedFromPlans(ownerId);
+    final tomorrow = _dateStr(DateTime.now().add(const Duration(days: 1)));
+    final todayKitchen = _composeKitchen(
+      date: today,
+      expected: expected,
+      baseLunch: baseLunch,
+      baseDinner: baseDinner,
+      approved: approved,
+    );
+    final tomorrowKitchen = _composeKitchen(
+      date: tomorrow,
+      expected: expected,
+      baseLunch: baseLunch,
+      baseDinner: baseDinner,
+      approved: approved,
     );
 
     final importRows = await _client
@@ -557,8 +1034,13 @@ class DatabaseService {
       finalDinner: summary.finalDinner,
       pendingCount: pendingCount,
       approvedTodayCount: approvedTodayCount,
+      scheduledCount: scheduledCount,
+      activeCustomers: customerCounts['active'] ?? 0,
+      pausedCustomers: customerCounts['paused'] ?? 0,
       importedCount: importedCount,
       latestImportAt: latestImportAt,
+      today: todayKitchen,
+      tomorrow: tomorrowKitchen,
       recentActivity: activity,
     );
   }

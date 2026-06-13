@@ -1,18 +1,21 @@
 import 'package:flutter/material.dart';
 
 import '../models/dashboard.dart';
+import '../models/kitchen_summary.dart';
 import '../profile/owner_profile.dart';
 import '../services/database_service.dart';
 import '../services/recent_activity_prefs.dart';
 import '../widgets/common.dart';
 
-/// Owner dashboard: greeting, today's final counts, key tallies, quick actions
-/// and a recent-activity feed. All figures are live from Supabase.
+/// Owner dashboard: greeting, today's & tomorrow's kitchen summary, key
+/// tallies, quick actions and a recent-activity feed. All figures are live
+/// from Supabase.
 class HomeScreen extends StatefulWidget {
   const HomeScreen({
     super.key,
     required this.profile,
     required this.databaseService,
+    required this.onOpenCustomers,
     required this.onOpenImport,
     required this.onOpenRequests,
     required this.onOpenDaily,
@@ -21,6 +24,7 @@ class HomeScreen extends StatefulWidget {
 
   final OwnerProfile profile;
   final DatabaseService databaseService;
+  final VoidCallback onOpenCustomers;
   final VoidCallback onOpenImport;
   final VoidCallback onOpenRequests;
   final VoidCallback onOpenDaily;
@@ -143,14 +147,11 @@ class HomeScreenState extends State<HomeScreen> {
         children: [
           _Greeting(profile: widget.profile),
           const SizedBox(height: 16),
-          _CountRow(lunch: s.finalLunch, dinner: s.finalDinner),
+          _KitchenCard(title: "Today's kitchen", summary: s.today),
           const SizedBox(height: 12),
-          _TallyRow(
-            pending: s.pendingCount,
-            approvedToday: s.approvedTodayCount,
-            imports: s.importedCount,
-            latestImport: s.latestImportAt,
-          ),
+          _KitchenCard(title: "Tomorrow's kitchen", summary: s.tomorrow),
+          const SizedBox(height: 16),
+          _StatsGrid(summary: s),
           const SizedBox(height: 16),
           Text('Quick actions',
               style: Theme.of(context)
@@ -159,6 +160,7 @@ class HomeScreenState extends State<HomeScreen> {
                   ?.copyWith(fontWeight: FontWeight.w800)),
           const SizedBox(height: 10),
           _QuickActions(
+            onOpenCustomers: widget.onOpenCustomers,
             onOpenImport: widget.onOpenImport,
             onOpenRequests: widget.onOpenRequests,
             onOpenDaily: widget.onOpenDaily,
@@ -237,117 +239,166 @@ class _Greeting extends StatelessWidget {
   }
 }
 
-class _CountRow extends StatelessWidget {
-  const _CountRow({required this.lunch, required this.dinner});
-  final int lunch;
-  final int dinner;
+/// Today's / tomorrow's "how much to cook" card: breakfast, lunch and dinner
+/// each shown as expected − cancelled + extra = final.
+class _KitchenCard extends StatelessWidget {
+  const _KitchenCard({required this.title, required this.summary});
+  final String title;
+  final KitchenSummary summary;
 
   @override
   Widget build(BuildContext context) {
-    return Row(
-      children: [
-        Expanded(
-          child: _BigCount(
-            label: 'Lunch today',
-            count: lunch,
+    return SectionCard(
+      title: title,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _MealLine(
+            label: 'Breakfast',
+            icon: Icons.bakery_dining,
+            color: const Color(0xFFCA8A04),
+            count: summary.breakfast,
+          ),
+          const Divider(height: 18),
+          _MealLine(
+            label: 'Lunch',
             icon: Icons.lunch_dining,
             color: const Color(0xFFEA580C),
+            count: summary.lunch,
           ),
+          const Divider(height: 18),
+          _MealLine(
+            label: 'Dinner',
+            icon: Icons.dinner_dining,
+            color: const Color(0xFF7C3AED),
+            count: summary.dinner,
+          ),
+          const SizedBox(height: 8),
+          Text(
+            summary.fromPlans
+                ? 'Expected from active customer meal plans.'
+                : 'Expected from base counts (Settings). Assign meal plans for '
+                    'per-customer accuracy.',
+            style: TextStyle(color: Colors.grey.shade500, fontSize: 11),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _MealLine extends StatelessWidget {
+  const _MealLine({
+    required this.label,
+    required this.icon,
+    required this.color,
+    required this.count,
+  });
+  final String label;
+  final IconData icon;
+  final Color color;
+  final MealCount count;
+
+  @override
+  Widget build(BuildContext context) {
+    final parts = <String>[
+      'expected ${count.expected}',
+      if (count.cancelled > 0) '−${count.cancelled} cancelled',
+      if (count.extra > 0) '+${count.extra} extra',
+    ];
+    return Row(
+      children: [
+        Container(
+          padding: const EdgeInsets.all(8),
+          decoration: BoxDecoration(
+            color: color.withValues(alpha: 0.12),
+            borderRadius: BorderRadius.circular(12),
+          ),
+          child: Icon(icon, color: color, size: 20),
         ),
         const SizedBox(width: 12),
         Expanded(
-          child: _BigCount(
-            label: 'Dinner today',
-            count: dinner,
-            icon: Icons.dinner_dining,
-            color: const Color(0xFF7C3AED),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(label,
+                  style: const TextStyle(
+                      fontWeight: FontWeight.w700, fontSize: 15)),
+              Text(parts.join(' · '),
+                  style: TextStyle(color: Colors.grey.shade600, fontSize: 12)),
+            ],
           ),
+        ),
+        Column(
+          crossAxisAlignment: CrossAxisAlignment.end,
+          children: [
+            Text('${count.finalCount}',
+                style: TextStyle(
+                    fontSize: 26, fontWeight: FontWeight.w900, color: color)),
+            Text('final',
+                style: TextStyle(color: Colors.grey.shade500, fontSize: 11)),
+          ],
         ),
       ],
     );
   }
 }
 
-class _BigCount extends StatelessWidget {
-  const _BigCount({
-    required this.label,
-    required this.count,
-    required this.icon,
-    required this.color,
-  });
-  final String label;
-  final int count;
-  final IconData icon;
-  final Color color;
+/// Key tallies: needs review, confirmed/scheduled, active & paused customers.
+class _StatsGrid extends StatelessWidget {
+  const _StatsGrid({required this.summary});
+  final DashboardSummary summary;
 
   @override
   Widget build(BuildContext context) {
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
+    return Column(
+      children: [
+        Row(
           children: [
-            Icon(icon, color: color, size: 30),
-            const SizedBox(height: 10),
-            Text('$count',
-                style: const TextStyle(
-                    fontSize: 40, fontWeight: FontWeight.w900, height: 1)),
-            const SizedBox(height: 2),
-            Text(label, style: const TextStyle(fontWeight: FontWeight.w600)),
+            Expanded(
+              child: _MiniStat(
+                value: '${summary.pendingCount}',
+                label: 'Needs review',
+                sub: 'Requests',
+                icon: Icons.pending_actions,
+                color: const Color(0xFFD97706),
+              ),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: _MiniStat(
+                value: '${summary.scheduledCount}',
+                label: 'Confirmed',
+                sub: 'Scheduled',
+                icon: Icons.event_available,
+                color: const Color(0xFF16A34A),
+              ),
+            ),
           ],
         ),
-      ),
-    );
-  }
-}
-
-class _TallyRow extends StatelessWidget {
-  const _TallyRow({
-    required this.pending,
-    required this.approvedToday,
-    required this.imports,
-    required this.latestImport,
-  });
-  final int pending;
-  final int approvedToday;
-  final int imports;
-  final DateTime? latestImport;
-
-  @override
-  Widget build(BuildContext context) {
-    final importSub =
-        latestImport == null ? 'No imports yet' : relativeTime(latestImport);
-    return Row(
-      children: [
-        Expanded(
-          child: _MiniStat(
-            value: '$pending',
-            label: 'Pending',
-            sub: 'Need review',
-            icon: Icons.pending_actions,
-            color: const Color(0xFFD97706),
-          ),
-        ),
-        const SizedBox(width: 12),
-        Expanded(
-          child: _MiniStat(
-            value: '$approvedToday',
-            label: 'Approved',
-            sub: 'For today',
-            icon: Icons.task_alt,
-            color: const Color(0xFF16A34A),
-          ),
-        ),
-        const SizedBox(width: 12),
-        Expanded(
-          child: _MiniStat(
-            value: '$imports',
-            label: 'Imports',
-            sub: importSub,
-            icon: Icons.history,
-            color: const Color(0xFF2563EB),
-          ),
+        const SizedBox(height: 12),
+        Row(
+          children: [
+            Expanded(
+              child: _MiniStat(
+                value: '${summary.activeCustomers}',
+                label: 'Active',
+                sub: 'Customers',
+                icon: Icons.groups,
+                color: const Color(0xFF2563EB),
+              ),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: _MiniStat(
+                value: '${summary.pausedCustomers}',
+                label: 'Paused',
+                sub: 'Customers',
+                icon: Icons.pause_circle_outline,
+                color: const Color(0xFF64748B),
+              ),
+            ),
+          ],
         ),
       ],
     );
@@ -397,11 +448,13 @@ class _MiniStat extends StatelessWidget {
 
 class _QuickActions extends StatelessWidget {
   const _QuickActions({
+    required this.onOpenCustomers,
     required this.onOpenImport,
     required this.onOpenRequests,
     required this.onOpenDaily,
     required this.onOpenLedger,
   });
+  final VoidCallback onOpenCustomers;
   final VoidCallback onOpenImport;
   final VoidCallback onOpenRequests;
   final VoidCallback onOpenDaily;
@@ -417,6 +470,12 @@ class _QuickActions extends StatelessWidget {
       mainAxisSpacing: 12,
       childAspectRatio: 1.7,
       children: [
+        _ActionCard(
+          icon: Icons.groups,
+          label: 'Customers',
+          color: const Color(0xFF0D9488),
+          onTap: onOpenCustomers,
+        ),
         _ActionCard(
           icon: Icons.upload_file,
           label: 'Import chat',

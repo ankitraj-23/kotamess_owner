@@ -6,6 +6,7 @@ import 'auth/auth_service.dart';
 import 'profile/owner_profile.dart';
 import 'profile/owner_profile_service.dart';
 import 'screens/chat_import_screen.dart';
+import 'screens/customers_screen.dart';
 import 'screens/daily_screen.dart';
 import 'screens/home_screen.dart';
 import 'screens/ledger_screen.dart';
@@ -135,7 +136,16 @@ class _KotaShellState extends State<KotaShell> {
   final _databaseService = DatabaseService();
   final _extractionService = ExtractionService();
 
+  // Tab indices: 0 Home, 1 Customers, 2 Import, 3 Requests, 4 Daily, 5 Ledger.
+  static const _tabHome = 0;
+  static const _tabCustomers = 1;
+  static const _tabImport = 2;
+  static const _tabRequests = 3;
+  static const _tabDaily = 4;
+  static const _tabLedger = 5;
+
   final _homeKey = GlobalKey<HomeScreenState>();
+  final _customersKey = GlobalKey<CustomersScreenState>();
   final _requestsKey = GlobalKey<MealRequestsScreenState>();
   final _dailyKey = GlobalKey<DailyScreenState>();
   final _ledgerKey = GlobalKey<LedgerScreenState>();
@@ -152,16 +162,19 @@ class _KotaShellState extends State<KotaShell> {
 
   void _refreshTab(int index) {
     switch (index) {
-      case 0:
+      case _tabHome:
         _homeKey.currentState?.reload();
         break;
-      case 2:
+      case _tabCustomers:
+        _customersKey.currentState?.reload();
+        break;
+      case _tabRequests:
         _requestsKey.currentState?.reload();
         break;
-      case 3:
+      case _tabDaily:
         _dailyKey.currentState?.reload();
         break;
-      case 4:
+      case _tabLedger:
         _ledgerKey.currentState?.reload();
         break;
     }
@@ -170,7 +183,7 @@ class _KotaShellState extends State<KotaShell> {
   void _onImportSaved() {
     // Pending count and activity changed: refresh Home, then show Requests.
     _homeKey.currentState?.reload();
-    _select(2);
+    _select(_tabRequests);
   }
 
   Future<void> _openSettings() async {
@@ -196,11 +209,13 @@ class _KotaShellState extends State<KotaShell> {
         key: _homeKey,
         profile: _profile,
         databaseService: _databaseService,
-        onOpenImport: () => _select(1),
-        onOpenRequests: () => _select(2),
-        onOpenDaily: () => _select(3),
-        onOpenLedger: () => _select(4),
+        onOpenCustomers: () => _select(_tabCustomers),
+        onOpenImport: () => _select(_tabImport),
+        onOpenRequests: () => _select(_tabRequests),
+        onOpenDaily: () => _select(_tabDaily),
+        onOpenLedger: () => _select(_tabLedger),
       ),
+      CustomersScreen(key: _customersKey, databaseService: _databaseService),
       ChatImportScreen(
         extractionService: _extractionService,
         databaseService: _databaseService,
@@ -273,6 +288,10 @@ class _KotaShellState extends State<KotaShell> {
                 icon: Icon(Icons.home_outlined),
                 selectedIcon: Icon(Icons.home),
                 label: 'Home'),
+            NavigationDestination(
+                icon: Icon(Icons.groups_outlined),
+                selectedIcon: Icon(Icons.groups),
+                label: 'Customers'),
             NavigationDestination(
                 icon: Icon(Icons.upload_file_outlined),
                 selectedIcon: Icon(Icons.upload_file),

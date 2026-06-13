@@ -111,6 +111,46 @@ class MealRequestsScreenState extends State<MealRequestsScreen> {
         () => widget.databaseService.rejectMealRequest(r.id), 'Rejected');
   }
 
+  Future<void> _markCompleted(MealRequest r) async {
+    await _guard(
+        () => widget.databaseService.markRequestCompleted(r.id), 'Completed');
+  }
+
+  Future<void> _cancel(MealRequest r) async {
+    await _guard(() => widget.databaseService.cancelRequest(r.id), 'Cancelled');
+  }
+
+  /// Opens a small dialog to add/edit the owner's private note on a request.
+  Future<void> _addNote(MealRequest r) async {
+    final controller = TextEditingController(text: r.ownerNote);
+    final note = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Owner note'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          minLines: 1,
+          maxLines: 4,
+          decoration: const InputDecoration(
+            hintText: 'Private note for this request',
+          ),
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Cancel')),
+          FilledButton(
+              onPressed: () => Navigator.pop(context, controller.text.trim()),
+              child: const Text('Save')),
+        ],
+      ),
+    );
+    controller.dispose();
+    if (note == null) return;
+    await _guard(() => widget.databaseService.addOwnerNote(r.id, note), 'Note saved');
+  }
+
   Future<void> _approveSelected() async {
     final ids = _selected.toList();
     if (ids.isEmpty) return;
@@ -189,8 +229,10 @@ class MealRequestsScreenState extends State<MealRequestsScreen> {
                 scrollDirection: Axis.horizontal,
                 child: Row(
                   children: [
-                    _filterChip('Pending', 'pending'),
-                    _filterChip('Approved', 'approved'),
+                    _filterChip('Needs review', 'pending'),
+                    _filterChip('Confirmed', 'approved'),
+                    _filterChip('Completed', 'completed'),
+                    _filterChip('Cancelled', 'cancelled'),
                     _filterChip('Rejected', 'rejected'),
                     _filterChip('All', 'all'),
                   ],
@@ -268,6 +310,12 @@ class MealRequestsScreenState extends State<MealRequestsScreen> {
                   onEdit: () => _edit(r),
                   onLink: () => _linkStudent(r),
                   onDelete: () => _delete(r),
+                  onComplete:
+                      r.status == 'approved' ? () => _markCompleted(r) : null,
+                  onCancel: (r.status == 'pending' || r.status == 'approved')
+                      ? () => _cancel(r)
+                      : null,
+                  onAddNote: () => _addNote(r),
                 )),
         ],
       ),
@@ -298,6 +346,9 @@ class _RequestCard extends StatelessWidget {
     required this.onEdit,
     required this.onLink,
     required this.onDelete,
+    required this.onComplete,
+    required this.onCancel,
+    required this.onAddNote,
   });
 
   final MealRequest request;
@@ -310,6 +361,9 @@ class _RequestCard extends StatelessWidget {
   final VoidCallback onEdit;
   final VoidCallback onLink;
   final VoidCallback onDelete;
+  final VoidCallback? onComplete;
+  final VoidCallback? onCancel;
+  final VoidCallback onAddNote;
 
   @override
   Widget build(BuildContext context) {
@@ -333,13 +387,25 @@ class _RequestCard extends StatelessWidget {
                 PopupMenuButton<String>(
                   onSelected: (v) => switch (v) {
                     'edit' => onEdit(),
+                    'note' => onAddNote(),
+                    'complete' => onComplete?.call(),
+                    'cancel' => onCancel?.call(),
                     'link' => onLink(),
                     _ => onDelete(),
                   },
-                  itemBuilder: (context) => const [
-                    PopupMenuItem(value: 'edit', child: Text('Edit')),
-                    PopupMenuItem(value: 'link', child: Text('Link student…')),
-                    PopupMenuItem(value: 'delete', child: Text('Delete')),
+                  itemBuilder: (context) => [
+                    const PopupMenuItem(value: 'edit', child: Text('Edit')),
+                    const PopupMenuItem(
+                        value: 'note', child: Text('Add / edit note')),
+                    if (onComplete != null)
+                      const PopupMenuItem(
+                          value: 'complete', child: Text('Mark completed')),
+                    if (onCancel != null)
+                      const PopupMenuItem(
+                          value: 'cancel', child: Text('Cancel request')),
+                    const PopupMenuItem(
+                        value: 'link', child: Text('Link student…')),
+                    const PopupMenuItem(value: 'delete', child: Text('Delete')),
                   ],
                 ),
               ],
@@ -362,6 +428,24 @@ class _RequestCard extends StatelessWidget {
               const SizedBox(height: 4),
               Text(request.reason,
                   style: TextStyle(color: Colors.grey.shade600, fontSize: 12)),
+            ],
+            if (request.ownerNote.isNotEmpty) ...[
+              const SizedBox(height: 6),
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Icon(Icons.sticky_note_2_outlined,
+                      size: 14, color: Colors.amber.shade800),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text('Note: ${request.ownerNote}',
+                        style: TextStyle(
+                            color: Colors.amber.shade900,
+                            fontSize: 12,
+                            fontWeight: FontWeight.w600)),
+                  ),
+                ],
+              ),
             ],
             if (onApprove != null || onReject != null) ...[
               const SizedBox(height: 8),
@@ -414,9 +498,13 @@ class _StatusTag extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final color = status == 'approved'
-        ? Colors.green
-        : (status == 'rejected' ? Colors.red : Colors.blueGrey);
+    final color = switch (status) {
+      'approved' => Colors.green,
+      'completed' => Colors.blue,
+      'rejected' => Colors.red,
+      'cancelled' => Colors.blueGrey,
+      _ => Colors.orange,
+    };
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
       decoration: BoxDecoration(

@@ -4,6 +4,7 @@ import '../models/student.dart';
 import '../profile/owner_profile.dart';
 import '../profile/owner_profile_service.dart';
 import '../services/database_service.dart';
+import 'meal_plans_screen.dart';
 
 /// Owner settings: profile + base counts, retention window with cleanup,
 /// logout and app info. Pushed as its own route from the app bar.
@@ -129,6 +130,15 @@ class _SettingsScreenState extends State<SettingsScreen> {
     } finally {
       if (mounted) setState(() => _cleaning = false);
     }
+  }
+
+  Future<void> _openMealPlans() async {
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) =>
+            MealPlansScreen(databaseService: widget.databaseService),
+      ),
+    );
   }
 
   Future<void> _openMergeStudents() async {
@@ -323,6 +333,28 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     : const Icon(Icons.save_outlined),
                 label: const Text('Save settings'),
               ),
+            ),
+            const SizedBox(height: 16),
+            _SettingsCard(
+              title: 'Meal plans',
+              icon: Icons.restaurant_outlined,
+              children: [
+                const Text(
+                  'Create subscription plans (e.g. "Lunch only", "Full day") '
+                  'and assign them to customers. Plans drive the expected '
+                  'kitchen counts on your dashboard.',
+                  style: TextStyle(color: Colors.black54, fontSize: 13),
+                ),
+                const SizedBox(height: 12),
+                SizedBox(
+                  width: double.infinity,
+                  child: OutlinedButton.icon(
+                    onPressed: _openMealPlans,
+                    icon: const Icon(Icons.restaurant_menu_outlined),
+                    label: const Text('Manage meal plans'),
+                  ),
+                ),
+              ],
             ),
             const SizedBox(height: 16),
             _SettingsCard(
