@@ -1,6 +1,8 @@
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../models/audit_log.dart';
+import '../models/chat_import.dart';
+import '../models/chat_message.dart';
 import '../models/daily_adjustment.dart';
 import '../models/daily_summary.dart';
 import '../models/dashboard.dart';
@@ -95,6 +97,58 @@ class DatabaseService {
         .select('id')
         .single();
     return row['id'] as String;
+  }
+
+  // --- Chat import history (read-only) ------------------------------------
+  //
+  // The `extract-requests` Edge Function writes chat_imports / chat_messages
+  // server-side; the app only reads them, owner-scoped, for Import History.
+
+  /// Past import runs for this owner, newest first.
+  Future<List<ChatImport>> fetchChatImports({int limit = 50}) async {
+    final ownerId = getCurrentOwnerId();
+    final rows = await _client
+        .from('chat_imports')
+        .select()
+        .eq('owner_id', ownerId)
+        .order('created_at', ascending: false)
+        .limit(limit);
+    return rows
+        .map((e) => ChatImport.fromJson(Map<String, dynamic>.from(e)))
+        .toList();
+  }
+
+  /// Parsed messages for one import run, newest first (capped for the UI).
+  Future<List<ChatMessage>> fetchChatMessages(
+    String importId, {
+    int limit = 50,
+  }) async {
+    final ownerId = getCurrentOwnerId();
+    final rows = await _client
+        .from('chat_messages')
+        .select()
+        .eq('owner_id', ownerId)
+        .eq('import_id', importId)
+        .order('message_timestamp', ascending: false, nullsFirst: false)
+        .order('created_at', ascending: false)
+        .limit(limit);
+    return rows
+        .map((e) => ChatMessage.fromJson(Map<String, dynamic>.from(e)))
+        .toList();
+  }
+
+  /// Extracted requests linked to one import run, newest first.
+  Future<List<MealRequest>> fetchRequestsForImport(String importId) async {
+    final ownerId = getCurrentOwnerId();
+    final rows = await _client
+        .from('meal_requests')
+        .select()
+        .eq('owner_id', ownerId)
+        .eq('import_id', importId)
+        .order('created_at', ascending: false);
+    return rows
+        .map((e) => MealRequest.fromJson(Map<String, dynamic>.from(e)))
+        .toList();
   }
 
   // --- Meal requests ------------------------------------------------------

@@ -21,6 +21,13 @@ class MealRequest {
   final DateTime? createdAt;
   final DateTime? completedAt;
 
+  /// Links back to the `chat_imports` run that produced this request (0008).
+  final String? importId;
+
+  /// Duplicate flag set during import: 'unique' | 'possible_duplicate' |
+  /// 'duplicate' (0008). Defaults to 'unique' for older rows.
+  final String duplicateStatus;
+
   MealRequest({
     required this.id,
     required this.ownerId,
@@ -38,6 +45,8 @@ class MealRequest {
     required this.source,
     required this.createdAt,
     this.completedAt,
+    this.importId,
+    this.duplicateStatus = 'unique',
   });
 
   factory MealRequest.fromJson(Map<String, dynamic> json) {
@@ -58,6 +67,8 @@ class MealRequest {
       source: json['source'] as String? ?? 'paste',
       createdAt: DateTime.tryParse(json['created_at'] as String? ?? ''),
       completedAt: DateTime.tryParse(json['completed_at'] as String? ?? ''),
+      importId: json['import_id'] as String?,
+      duplicateStatus: json['duplicate_status'] as String? ?? 'unique',
     );
   }
 
@@ -77,6 +88,18 @@ class MealRequest {
   String get requestTypeLabel => MealRequestVocab.typeLabel(requestType);
   String get mealTypeLabel => MealRequestVocab.mealLabel(mealType);
   String get statusLabel => MealRequestVocab.statusLabel(status);
+
+  bool get isDuplicateFlagged => duplicateStatus != 'unique';
+  String get duplicateStatusLabel {
+    switch (duplicateStatus) {
+      case 'duplicate':
+        return 'Duplicate';
+      case 'possible_duplicate':
+        return 'Possible duplicate';
+      default:
+        return 'Unique';
+    }
+  }
 
   String get dateDisplay {
     if (requestDate != null && requestDate!.isNotEmpty) return requestDate!;

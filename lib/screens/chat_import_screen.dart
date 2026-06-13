@@ -4,6 +4,7 @@ import '../models/extraction_result.dart';
 import '../services/database_service.dart';
 import '../services/extraction_service.dart';
 import '../services/whatsapp_import.dart';
+import 'import_history_screen.dart';
 
 /// Import WhatsApp chat (paste / .txt / .zip) → the server parses it, extracts
 /// requests, and saves them as pending `meal_requests`. The app just shows the
@@ -84,6 +85,15 @@ class _ChatImportScreenState extends State<ChatImportScreen> {
     });
   }
 
+  void _openHistory() {
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) =>
+            ImportHistoryScreen(databaseService: widget.databaseService),
+      ),
+    );
+  }
+
   Future<void> _import() async {
     final text = _input.text.trim();
     if (text.isEmpty) {
@@ -117,6 +127,16 @@ class _ChatImportScreenState extends State<ChatImportScreen> {
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
+        Card(
+          margin: const EdgeInsets.only(bottom: 16),
+          child: ListTile(
+            leading: const Icon(Icons.history),
+            title: const Text('View import history'),
+            subtitle: const Text('Past imports and the requests they extracted'),
+            trailing: const Icon(Icons.chevron_right),
+            onTap: _busy ? null : _openHistory,
+          ),
+        ),
         Card(
           child: Padding(
             padding: const EdgeInsets.all(18),

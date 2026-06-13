@@ -154,3 +154,17 @@ String relativeTime(DateTime? time) {
   final d = time;
   return '${d.day}/${d.month}/${d.year % 100}';
 }
+
+/// Compact absolute timestamp like "14 Jun 2026, 3:05 pm" (local time, no intl).
+String formatStamp(DateTime? time) {
+  if (time == null) return '—';
+  const months = [
+    'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+    'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
+  ];
+  final t = time.toLocal();
+  final ampm = t.hour < 12 ? 'am' : 'pm';
+  final hour12 = t.hour % 12 == 0 ? 12 : t.hour % 12;
+  final minute = t.minute.toString().padLeft(2, '0');
+  return '${t.day} ${months[t.month - 1]} ${t.year}, $hour12:$minute $ampm';
+}
