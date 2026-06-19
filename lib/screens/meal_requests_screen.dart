@@ -25,6 +25,10 @@ class MealRequestsScreenState extends State<MealRequestsScreen> {
   List<MealRequest> _items = [];
   final Set<String> _selected = {};
 
+  /// Requests with an in-flight status mutation. Drives per-card loading so
+  /// only the tapped card's actions are disabled, never the whole screen.
+  final Set<String> _busyRequestIds = {};
+
   /// Request ids that already have a linked ledger entry (for the badge).
   Set<String> _ledgerLinked = {};
 
@@ -41,11 +45,17 @@ class MealRequestsScreenState extends State<MealRequestsScreen> {
   }
 
   /// Public so the shell can refresh after an import saves new requests.
-  Future<void> reload() async {
-    setState(() {
-      _loading = true;
-      _error = null;
-    });
+  ///
+  /// [silent] skips the full-page spinner and keeps the current list visible
+  /// on failure — used after a mutation so the screen never blanks/reloads
+  /// under the owner. Pull-to-refresh and filter changes use the full path.
+  Future<void> reload({bool silent = false}) async {
+    if (!silent) {
+      setState(() {
+        _loading = true;
+        _error = null;
+      });
+    }
     try {
       final items = await widget.databaseService.fetchMealRequests(
         status: _filter,
@@ -61,10 +71,66 @@ class MealRequestsScreenState extends State<MealRequestsScreen> {
       });
     } catch (_) {
       if (!mounted) return;
+      if (silent) return; // keep the current list; the action already landed
       setState(() {
         _error = 'Could not load requests. Pull to refresh.';
         _loading = false;
       });
+    }
+  }
+
+  /// Shows a single short success/error message, replacing any current one so
+  /// rapid actions don't stack a tower of SnackBars.
+  void _showSnack(String message) {
+    if (!mounted) return;
+    final messenger = ScaffoldMessenger.of(context);
+    messenger.hideCurrentSnackBar();
+    messenger.showSnackBar(
+      SnackBar(content: Text(message), duration: const Duration(seconds: 1)),
+    );
+  }
+
+  /// Optimistic status change: flips the local status (and drops the card from
+  /// the list if it no longer matches the active filter) immediately, then runs
+  /// the DB update in the background. On failure it reverts and reports it.
+  Future<void> _mutateStatus(
+    MealRequest r,
+    String newStatus,
+    Future<void> Function() action,
+    String done,
+  ) async {
+    if (_busyRequestIds.contains(r.id)) return;
+    final oldStatus = r.status;
+    final oldIndex = _items.indexOf(r);
+    // Drop from the list when the new status leaves the current filter (e.g.
+    // approving a card while viewing "Needs review"). 'all' keeps every card.
+    final leavesFilter = _filter != 'all' && newStatus != _filter;
+
+    setState(() {
+      _busyRequestIds.add(r.id);
+      r.status = newStatus;
+      _selected.remove(r.id);
+      if (leavesFilter) _items.removeWhere((x) => x.id == r.id);
+    });
+
+    try {
+      await action();
+      if (!mounted) return;
+      setState(() => _busyRequestIds.remove(r.id));
+      _showSnack(done);
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _busyRequestIds.remove(r.id);
+        r.status = oldStatus;
+        if (leavesFilter && !_items.any((x) => x.id == r.id)) {
+          final at = (oldIndex >= 0 && oldIndex <= _items.length)
+              ? oldIndex
+              : _items.length;
+          _items.insert(at, r);
+        }
+      });
+      _showSnack('Action failed. Please try again.');
     }
   }
 
@@ -79,9 +145,11 @@ class MealRequestsScreenState extends State<MealRequestsScreen> {
   Future<void> _approve(MealRequest r) async {
     final addsLedger =
         r.requestType == 'payment_note' || r.requestType == 'dues_query';
-    await _guard(
+    await _mutateStatus(
+      r,
+      'approved',
       () => widget.databaseService.approveMealRequest(r.id),
-      addsLedger ? 'Approved and added to Ledger' : 'Approved',
+      addsLedger ? 'Approved · added to Ledger' : 'Approved',
     );
   }
 
@@ -97,27 +165,24 @@ class MealRequestsScreenState extends State<MealRequestsScreen> {
       ),
     );
     if (linked == true) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Student linked.')),
-        );
-      }
-      reload();
+      _showSnack('Student linked.');
+      reload(silent: true);
     }
   }
 
   Future<void> _reject(MealRequest r) async {
-    await _guard(
+    await _mutateStatus(r, 'rejected',
         () => widget.databaseService.rejectMealRequest(r.id), 'Rejected');
   }
 
   Future<void> _markCompleted(MealRequest r) async {
-    await _guard(
+    await _mutateStatus(r, 'completed',
         () => widget.databaseService.markRequestCompleted(r.id), 'Completed');
   }
 
   Future<void> _cancel(MealRequest r) async {
-    await _guard(() => widget.databaseService.cancelRequest(r.id), 'Cancelled');
+    await _mutateStatus(r, 'cancelled',
+        () => widget.databaseService.cancelRequest(r.id), 'Cancelled');
   }
 
   /// Opens a small dialog to add/edit the owner's private note on a request.
@@ -178,18 +243,17 @@ class MealRequestsScreenState extends State<MealRequestsScreen> {
     );
   }
 
-  /// Runs a mutation, shows a SnackBar, and reloads. Surfaces errors safely.
+  /// Runs a one-off mutation (edit/note/delete/link/batch), shows a single
+  /// SnackBar, then silently refreshes so the list stays put — no full-page
+  /// spinner. Status changes use [_mutateStatus] instead.
   Future<void> _guard(Future<void> Function() action, String done) async {
     try {
       await action();
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(done)));
-      await reload();
+      _showSnack(done);
+      await reload(silent: true);
     } catch (_) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Action failed. Please try again.')),
-      );
+      _showSnack('Action failed. Please try again.');
     }
   }
 
@@ -281,6 +345,7 @@ class MealRequestsScreenState extends State<MealRequestsScreen> {
                   request: r,
                   selectable: showSelection,
                   selected: _selected.contains(r.id),
+                  busy: _busyRequestIds.contains(r.id),
                   ledgerLinked: _ledgerLinked.contains(r.id),
                   onSelectedChanged: (v) => setState(() {
                     if (v == true) {
@@ -371,6 +436,7 @@ class _RequestCard extends StatelessWidget {
     required this.request,
     required this.selectable,
     required this.selected,
+    required this.busy,
     required this.ledgerLinked,
     required this.onSelectedChanged,
     required this.onApprove,
@@ -386,6 +452,7 @@ class _RequestCard extends StatelessWidget {
   final MealRequest request;
   final bool selectable;
   final bool selected;
+  final bool busy;
   final bool ledgerLinked;
   final ValueChanged<bool?> onSelectedChanged;
   final VoidCallback? onApprove;
@@ -506,15 +573,22 @@ class _RequestCard extends StatelessWidget {
                 children: [
                   if (onReject != null)
                     TextButton.icon(
-                      onPressed: onReject,
+                      onPressed: busy ? null : onReject,
                       icon: const Icon(Icons.close),
                       label: const Text('Reject'),
                     ),
                   const SizedBox(width: 6),
                   if (onApprove != null)
                     FilledButton.icon(
-                      onPressed: onApprove,
-                      icon: const Icon(Icons.check),
+                      onPressed: busy ? null : onApprove,
+                      icon: busy
+                          ? const SizedBox(
+                              width: 16,
+                              height: 16,
+                              child: CircularProgressIndicator(
+                                  strokeWidth: 2, color: Colors.white),
+                            )
+                          : const Icon(Icons.check),
                       label: const Text('Approve'),
                     ),
                 ],
