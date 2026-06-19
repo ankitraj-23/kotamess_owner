@@ -28,6 +28,15 @@ class MealRequest {
   /// 'duplicate' (0008). Defaults to 'unique' for older rows.
   final String duplicateStatus;
 
+  /// Late-request flagging set by the extract-requests Edge Function (0010).
+  /// [isLateRequest] is true when the message arrived after [cutoffAt]
+  /// (meal time − owner cutoff). The request still stays pending — late only
+  /// flags it for review, it is never auto-rejected.
+  final bool isLateRequest;
+  final DateTime? cutoffAt;
+  final DateTime? messageReceivedAt;
+  final String? lateReason;
+
   MealRequest({
     required this.id,
     required this.ownerId,
@@ -47,6 +56,10 @@ class MealRequest {
     this.completedAt,
     this.importId,
     this.duplicateStatus = 'unique',
+    this.isLateRequest = false,
+    this.cutoffAt,
+    this.messageReceivedAt,
+    this.lateReason,
   });
 
   factory MealRequest.fromJson(Map<String, dynamic> json) {
@@ -69,6 +82,11 @@ class MealRequest {
       completedAt: DateTime.tryParse(json['completed_at'] as String? ?? ''),
       importId: json['import_id'] as String?,
       duplicateStatus: json['duplicate_status'] as String? ?? 'unique',
+      isLateRequest: json['is_late_request'] as bool? ?? false,
+      cutoffAt: DateTime.tryParse(json['cutoff_at'] as String? ?? ''),
+      messageReceivedAt:
+          DateTime.tryParse(json['message_received_at'] as String? ?? ''),
+      lateReason: json['late_reason'] as String?,
     );
   }
 

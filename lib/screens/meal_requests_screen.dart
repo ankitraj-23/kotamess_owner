@@ -450,10 +450,29 @@ class _RequestCard extends StatelessWidget {
                 if (request.mealType != 'none') _Tag(request.mealTypeLabel),
                 _Tag(request.dateDisplay),
                 _StatusTag(status: request.status),
+                if (request.isLateRequest) const _LateTag(),
                 if (request.studentId == null) const _Tag('Not linked'),
                 if (ledgerLinked) const _Tag('Ledger linked'),
               ],
             ),
+            if (request.isLateRequest &&
+                (request.lateReason?.isNotEmpty ?? false)) ...[
+              const SizedBox(height: 8),
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Icon(Icons.schedule, size: 14, color: Colors.red.shade700),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text(request.lateReason!,
+                        style: TextStyle(
+                            color: Colors.red.shade700,
+                            fontSize: 12,
+                            fontWeight: FontWeight.w600)),
+                  ),
+                ],
+              ),
+            ],
             const SizedBox(height: 8),
             Text('“${request.originalMessage}”',
                 style: TextStyle(color: Colors.grey.shade800)),
@@ -521,6 +540,34 @@ class _Tag extends StatelessWidget {
         borderRadius: BorderRadius.circular(999),
       ),
       child: Text(text, style: const TextStyle(fontSize: 12)),
+    );
+  }
+}
+
+/// Visible flag for a request that arrived after the owner's cutoff window.
+class _LateTag extends StatelessWidget {
+  const _LateTag();
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+      decoration: BoxDecoration(
+        color: Colors.red.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(999),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(Icons.schedule, size: 12, color: Colors.red.shade700),
+          const SizedBox(width: 4),
+          Text('Late',
+              style: TextStyle(
+                  fontSize: 12,
+                  color: Colors.red.shade700,
+                  fontWeight: FontWeight.w700)),
+        ],
+      ),
     );
   }
 }

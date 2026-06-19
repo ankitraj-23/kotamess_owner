@@ -53,6 +53,9 @@ const MEAL_TYPES = ["lunch", "dinner", "both", "none"];
 
 const RETENTION_DAYS = 90;
 const LOW_CONFIDENCE = 0.6;
+// Fallback request cutoff when owner_profiles has no usable value (matches the
+// migration default). Read the column first; never hardcode "60 minutes".
+const DEFAULT_CUTOFF_MINUTES = 60;
 
 interface ExtractedRequest {
   studentName: string;
@@ -187,9 +190,13 @@ serve(async (req: Request): Promise<Response> => {
     // --- Persist the processed messages --------------------------------
     // text_message -> id, used later to link meal_requests.message_id.
     const messageIdByText = new Map<string, string>();
+    // text_message -> parsed receipt time, used for the late-request cutoff
+    // check below. First occurrence wins (mirrors messageIdByText).
+    const messageTsByText = new Map<string, Date>();
     if (processed.length > 0) {
       const rows = processed.map((m) => {
         const ts = parseTimestamp(m.dateText);
+        if (ts && !messageTsByText.has(m.text)) messageTsByText.set(m.text, ts);
         return {
           owner_id: ownerId,
           import_id: importId,
@@ -256,6 +263,11 @@ serve(async (req: Request): Promise<Response> => {
     const existingByKey = await loadExistingDupKeys(supabase, ownerId);
     const batchFirstIndexByKey = new Map<string, number>();
 
+    // --- Late-request cutoff settings (owner_profiles) -----------------
+    // Meal serving times + the minutes-before-meal window. Read once; missing
+    // profile / values fall back to safe defaults and simply skip flagging.
+    const cutoffSettings = await loadCutoffSettings(supabase, ownerId);
+
     interface PendingDup {
       index: number;
       duplicateOf: string | null; // existing meal_requests.id, or null = within-batch
@@ -286,6 +298,15 @@ serve(async (req: Request): Promise<Response> => {
         batchFirstIndexByKey.set(key, i);
       }
 
+      // Late-request flagging. Never auto-rejects: status stays "pending"
+      // (needs review); the owner still confirms/rejects manually.
+      const late = computeLate(
+        r.mealType,
+        r.requestDate,
+        messageTsByText.get(r.originalMessage) ?? null,
+        cutoffSettings,
+      );
+
       return {
         owner_id: ownerId,
         student_id: linkedId,
@@ -302,6 +323,10 @@ serve(async (req: Request): Promise<Response> => {
         import_id: importId,
         message_id: messageIdByText.get(r.originalMessage) ?? null,
         duplicate_status: duplicateStatus,
+        is_late_request: late.isLate,
+        cutoff_at: late.cutoffAt,
+        message_received_at: late.messageReceivedAt,
+        late_reason: late.lateReason,
       };
     });
 
@@ -886,6 +911,142 @@ function parseTimestamp(dateText: string): Date | null {
   const ms = Date.UTC(year, month - 1, day, hour, minute, second);
   if (isNaN(ms)) return null;
   return new Date(ms);
+}
+
+// ---------------------------------------------------------------------------
+// Late-request cutoff
+// ---------------------------------------------------------------------------
+// Students must send change/cancel/add requests at least
+// `request_cutoff_minutes` before the affected meal. Anything later is FLAGGED
+// (is_late_request = true) for owner review — never auto-rejected.
+//
+// Timezone handling is deliberately library-free and deterministic: WhatsApp
+// timestamps are parsed as wall-clock (Asia/Kolkata) via parseTimestamp's
+// Date.UTC convention, and the meal time is applied to request_date the same
+// way. Both sides use the identical convention, so the comparison is correct
+// without any tz conversion.
+
+interface MealTime {
+  h: number;
+  m: number;
+}
+
+interface CutoffSettings {
+  breakfast: MealTime | null;
+  lunch: MealTime | null;
+  dinner: MealTime | null;
+  cutoffMinutes: number;
+}
+
+interface LateInfo {
+  isLate: boolean;
+  cutoffAt: string | null; // ISO; the computed deadline (null when not computed)
+  messageReceivedAt: string | null; // ISO; when the message arrived (if known)
+  lateReason: string | null; // human-readable; only set when late
+}
+
+// Parse a Postgres `time` value ("HH:MM" / "HH:MM:SS") into {h, m}. Returns
+// null for anything unusable so a blank/missing meal time simply disables the
+// check for that meal.
+function parseTimeOfDay(value: unknown): MealTime | null {
+  if (typeof value !== "string") return null;
+  const m = value.trim().match(/^(\d{1,2}):(\d{2})/);
+  if (!m) return null;
+  const h = parseInt(m[1], 10);
+  const min = parseInt(m[2], 10);
+  if (h < 0 || h > 23 || min < 0 || min > 59) return null;
+  return { h, m: min };
+}
+
+// Read the owner's meal times + cutoff window from owner_profiles
+// (id == auth uid). Any failure falls back to "no meal times + default
+// cutoff", which makes computeLate a no-op rather than crashing the import.
+async function loadCutoffSettings(
+  supabase: SupabaseClient,
+  ownerId: string,
+): Promise<CutoffSettings> {
+  const fallback: CutoffSettings = {
+    breakfast: null,
+    lunch: null,
+    dinner: null,
+    cutoffMinutes: DEFAULT_CUTOFF_MINUTES,
+  };
+  try {
+    const { data } = await supabase
+      .from("owner_profiles")
+      .select("breakfast_time, lunch_time, dinner_time, request_cutoff_minutes")
+      .eq("id", ownerId)
+      .maybeSingle();
+    if (!data) return fallback;
+    const cm = Number(data.request_cutoff_minutes);
+    return {
+      breakfast: parseTimeOfDay(data.breakfast_time),
+      lunch: parseTimeOfDay(data.lunch_time),
+      dinner: parseTimeOfDay(data.dinner_time),
+      cutoffMinutes: Number.isFinite(cm) && cm >= 0 ? cm : DEFAULT_CUTOFF_MINUTES,
+    };
+  } catch (_e) {
+    return fallback;
+  }
+}
+
+// Which meal's serving time governs a request, plus a label for the reason.
+// "both" binds on the earlier meal (lunch): missing the lunch deadline already
+// makes the day's cancellation late. Returns null when no meal time applies
+// (meal_type "none"/unknown, or that meal's time isn't configured) — those
+// requests are never flagged.
+function bindingMeal(
+  mealType: string,
+  s: CutoffSettings,
+): { time: MealTime; label: string } | null {
+  switch (mealType) {
+    case "breakfast":
+      return s.breakfast ? { time: s.breakfast, label: "breakfast" } : null;
+    case "lunch":
+      return s.lunch ? { time: s.lunch, label: "lunch" } : null;
+    case "dinner":
+      return s.dinner ? { time: s.dinner, label: "dinner" } : null;
+    case "both":
+      return s.lunch ? { time: s.lunch, label: "lunch" } : null;
+    default:
+      return null;
+  }
+}
+
+// Compute the late-request fields for one request. Missing meal type, missing
+// request date, missing message timestamp, or an unconfigured meal time all
+// resolve to "not late" — deterministic and crash-free.
+function computeLate(
+  mealType: string,
+  requestDate: string | null,
+  messageTs: Date | null,
+  s: CutoffSettings,
+): LateInfo {
+  const notLate: LateInfo = {
+    isLate: false,
+    cutoffAt: null,
+    messageReceivedAt: messageTs ? messageTs.toISOString() : null,
+    lateReason: null,
+  };
+  if (!messageTs) return notLate; // no message timestamp -> never late
+  if (!requestDate || !/^\d{4}-\d{2}-\d{2}$/.test(requestDate)) return notLate; // no date
+  const meal = bindingMeal(mealType, s);
+  if (!meal) return notLate; // no meal type, or that meal's time isn't set
+
+  const [y, mo, d] = requestDate.split("-").map((n) => parseInt(n, 10));
+  const mealMs = Date.UTC(y, mo - 1, d, meal.time.h, meal.time.m, 0);
+  if (isNaN(mealMs)) return notLate;
+  const cutoffMs = mealMs - s.cutoffMinutes * 60_000;
+  const isLate = messageTs.getTime() > cutoffMs;
+
+  return {
+    isLate,
+    cutoffAt: new Date(cutoffMs).toISOString(),
+    messageReceivedAt: messageTs.toISOString(),
+    lateReason: isLate
+      ? `Late request: message was sent after the ${s.cutoffMinutes}-minute cutoff for ${meal.label}.`
+      : null,
+  };
 }
 
 // ---------------------------------------------------------------------------
