@@ -6,7 +6,6 @@ import '../models/chat_message.dart';
 import '../models/daily_adjustment.dart';
 import '../models/daily_summary.dart';
 import '../models/dashboard.dart';
-import '../models/extraction_result.dart';
 import '../models/kitchen_summary.dart';
 import '../models/ledger_entry.dart';
 import '../models/meal_plan.dart';
@@ -154,45 +153,9 @@ class DatabaseService {
   }
 
   // --- Meal requests ------------------------------------------------------
-
-  /// Saves extracted requests as `pending`, linking each to a student
-  /// (existing or newly created) for this owner. Returns the inserted rows.
-  Future<List<MealRequest>> saveExtractedMealRequests(
-    List<ExtractedRequest> items, {
-    required String source,
-    String? importedMessageId,
-  }) async {
-    if (items.isEmpty) return [];
-    final ownerId = getCurrentOwnerId();
-    final studentIds = await _resolveStudentIds(
-      items.map((e) => e.studentName).toList(),
-      ownerId,
-    );
-
-    final rows = items.map((it) {
-      final key = _nameKey(it.studentName);
-      return <String, dynamic>{
-        'owner_id': ownerId,
-        'student_id': studentIds[key],
-        'student_name': it.studentName,
-        'original_message': it.originalMessage,
-        'request_type': it.requestType,
-        'meal_type': it.mealType,
-        'request_date': it.requestDate,
-        'date_label': it.dateLabel,
-        'status': 'pending',
-        'confidence': it.confidence,
-        'reason': it.reason,
-        'source': source,
-        if (importedMessageId != null) 'imported_message_id': importedMessageId,
-      };
-    }).toList();
-
-    final inserted = await _client.from('meal_requests').insert(rows).select();
-    return inserted
-        .map((e) => MealRequest.fromJson(Map<String, dynamic>.from(e)))
-        .toList();
-  }
+  //
+  // Extracted requests are saved server-side by the `extract-requests` Edge
+  // Function (as pending `meal_requests`); the app only reads/updates them here.
 
   Future<List<MealRequest>> fetchMealRequests({
     String? status, // 'pending'|'approved'|'rejected'|null/'all'
@@ -1651,18 +1614,41 @@ class DatabaseService {
 
   // --- Retention / cleanup ------------------------------------------------
 
-  /// Deletes this owner's imported_messages older than [retentionDays] and
-  /// returns how many were removed. Does NOT touch meal_requests, students,
-  /// ledger entries, the owner profile or the auth account.
+  /// Deletes this owner's old import history older than [retentionDays] and
+  /// returns how many import records were removed. Covers both the current and
+  /// the legacy import tables:
+  ///   * `chat_imports` older than the cutoff (the current import-history flow).
+  ///     Their `chat_messages` are removed automatically by the ON DELETE
+  ///     CASCADE FK defined in migration 0008; extracted `meal_requests` are
+  ///     KEPT — that FK is ON DELETE SET NULL, so deleting an import only
+  ///     unlinks (never deletes) the requests it produced.
+  ///   * legacy `imported_messages` older than the cutoff.
+  ///
+  /// Does NOT touch students/customers, meal_requests, ledger_entries, payments,
+  /// monthly_bills, the owner profile or the auth account.
   Future<int> cleanupOldImportedMessages(int retentionDays) async {
     final ownerId = getCurrentOwnerId();
-    final cutoff = DateTime.now().subtract(Duration(days: retentionDays));
-    final deleted = await _client
+    final cutoff = DateTime.now()
+        .subtract(Duration(days: retentionDays))
+        .toIso8601String();
+
+    // Current import history. chat_messages cascade-delete with their import;
+    // meal_requests are preserved (their import_id is set to null by the FK).
+    final deletedImports = await _client
+        .from('chat_imports')
+        .delete()
+        .eq('owner_id', ownerId)
+        .lt('created_at', cutoff)
+        .select('id');
+
+    // Legacy raw-text imports, kept around for older data.
+    final deletedLegacy = await _client
         .from('imported_messages')
         .delete()
         .eq('owner_id', ownerId)
-        .lt('created_at', cutoff.toIso8601String())
+        .lt('created_at', cutoff)
         .select('id');
-    return deleted.length;
+
+    return deletedImports.length + deletedLegacy.length;
   }
 }

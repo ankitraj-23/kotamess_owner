@@ -34,10 +34,11 @@ With the [Supabase CLI](https://supabase.com/docs/guides/cli) linked to the
 project (`supabase link --project-ref <ref>`):
 
 ```bash
-supabase db push                # applies everything in supabase/migrations
+supabase db push                # applies everything in supabase/migrations (0001 … 0010)
 ```
 
-Or run the files in `supabase/migrations/` in order in the SQL editor.
+Or run the files in `supabase/migrations/` in order (`0001` … `0010`) in the SQL
+editor. Every migration is additive and idempotent, so re-running is safe.
 
 ### Supabase Edge Function
 
@@ -59,9 +60,11 @@ supabase functions deploy extract-requests
 | `SUPABASE_ANON_KEY` | ✅ | Supabase anon / public (publishable) key. **Never** the `service_role` key |
 | `SUPABASE_EMAIL_REDIRECT_URL` | optional | HTTPS page for auth links; falls back to project Site URL if blank |
 
-CI / release builds can inject these with
-`--dart-define=SUPABASE_URL=... --dart-define=SUPABASE_ANON_KEY=...` instead of a
-bundled `.env`.
+`.env` is for **local development only** — it is git-ignored, never committed,
+and **not bundled as a build asset** (the app loads it best-effort and falls
+back to `--dart-define` when it is absent, so a clean build with no `.env` still
+works). **Release / CI builds should inject these with `--dart-define`:**
+`--dart-define=SUPABASE_URL=... --dart-define=SUPABASE_ANON_KEY=...`.
 
 ### Supabase Edge Function secrets — server-side only
 
@@ -78,17 +81,22 @@ supabase secrets set GEMINI_MODEL=gemini-2.5-flash   # optional
 `SUPABASE_URL` and `SUPABASE_ANON_KEY` are injected into Edge Functions
 automatically.
 
-- [ ] `.env` is **not** committed (it is git-ignored)
-- [ ] `service_role` key appears nowhere in the client app
+- [ ] `.env` is **not** committed (it is git-ignored) and is not a bundled asset
+- [ ] `service_role` key appears nowhere in the client app or the Edge Function
 - [ ] `GEMINI_API_KEY` exists only as a Supabase secret, never in `.env`
+- [ ] APK/AAB outputs, keystores (`*.jks` / `*.keystore` / `key.properties`),
+      `build/`, `.dart_tool/`, `.gradle/` and `supabase/.temp/` are git-ignored
+      (never committed)
 
 ---
 
 ## 3. RLS (Row Level Security) checklist
 
 - [ ] RLS is **enabled** on every owner-scoped table: `owner_profiles`,
-      `students`, `student_aliases`, `imported_messages`, `meal_requests`,
-      `daily_adjustments`, `ledger_entries`, and the billing/payment tables.
+      `students`, `student_aliases`, `imported_messages`, `chat_imports`,
+      `chat_messages`, `request_duplicates`, `meal_requests`, `meal_plans`,
+      `customer_meal_plans`, `daily_adjustments`, `ledger_entries`, `payments`,
+      `monthly_bills` and `audit_logs`.
 - [ ] Each table has policies restricting `select / insert / update / delete`
       to `auth.uid() = owner_id`.
 - [ ] No table is left with RLS off / a permissive `using (true)` policy.

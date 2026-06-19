@@ -51,10 +51,17 @@ dashboard / daily-count / ledger screens.
   adjustments, with a full breakdown and unclear-date review section.
 - **Ledger**: student-wise payment / due / adjustment / note entries with
   search, type filter, summary totals, and add / edit / delete.
-- **Retention / cleanup**: a Settings button deletes imported chats older than
-  the retention window (students, requests, ledger and account untouched).
-- **Database schema + RLS**: owners, students, imported messages, meal requests,
-  daily adjustments and ledger — each fully isolated per owner via RLS policies.
+- **Customers, plans & billing**: full customer lifecycle (active/paused/
+  inactive), subscription **meal plans**, per-customer **payments**, generated
+  **monthly bills**, customer balances, and an **audit log** of key actions.
+- **Import history**: each import run and its parsed messages are stored
+  (`chat_imports` / `chat_messages`) and browsable from the Import tab.
+- **Retention / cleanup**: a Settings button deletes old **import history**
+  (imported chat text) older than the retention window — customers, requests,
+  ledger, billing and the account are untouched.
+- **Database schema + RLS**: owner profiles, students/customers, aliases, import
+  history, meal requests, meal plans, daily adjustments, ledger, payments,
+  monthly bills and audit logs — each fully isolated per owner via RLS policies.
 
 > Only `SUPABASE_URL`, `SUPABASE_ANON_KEY` and `SUPABASE_EMAIL_REDIRECT_URL` live
 > in the app's `.env`. The **Gemini key never reaches the client** — it is a
@@ -70,19 +77,26 @@ dashboard / daily-count / ledger screens.
    **Project Settings → API**. (Never use the `service_role` key in the app.)
 
 ### b. Run the migrations
-Open **SQL Editor** in the Supabase dashboard and run, in order:
+Open **SQL Editor** in the Supabase dashboard and run every file in
+`supabase/migrations/` in order (`0001` … `0010`). Each migration is additive
+and idempotent:
 
-1. [`supabase/migrations/0001_init.sql`](supabase/migrations/0001_init.sql) — tables, indexes, triggers.
-2. [`supabase/migrations/0002_rls.sql`](supabase/migrations/0002_rls.sql) — enables RLS and the per-owner policies.
-3. [`supabase/migrations/0003_meal_requests_extraction.sql`](supabase/migrations/0003_meal_requests_extraction.sql) — reshapes `meal_requests` for the extraction vocabulary.
-4. [`supabase/migrations/0004_dashboard_ledger.sql`](supabase/migrations/0004_dashboard_ledger.sql) — adds owner base lunch/dinner counts and reshapes `ledger_entries` (entry types + `student_name`).
-5. [`supabase/migrations/0005_student_aliases_and_auto_ledger.sql`](supabase/migrations/0005_student_aliases_and_auto_ledger.sql) — adds the `student_aliases` table (+ its RLS) for name matching/merge, and a unique index so an approved payment/dues request creates at most one linked ledger entry.
+1. [`0001_init.sql`](supabase/migrations/0001_init.sql) — tables, indexes, triggers.
+2. [`0002_rls.sql`](supabase/migrations/0002_rls.sql) — enables RLS and the per-owner policies.
+3. [`0003_meal_requests_extraction.sql`](supabase/migrations/0003_meal_requests_extraction.sql) — reshapes `meal_requests` for the extraction vocabulary.
+4. [`0004_dashboard_ledger.sql`](supabase/migrations/0004_dashboard_ledger.sql) — adds owner base lunch/dinner counts and reshapes `ledger_entries` (entry types + `student_name`).
+5. [`0005_student_aliases_and_auto_ledger.sql`](supabase/migrations/0005_student_aliases_and_auto_ledger.sql) — adds the `student_aliases` table (+ its RLS) for name matching/merge, and a unique index so an approved payment/dues request creates at most one linked ledger entry.
+6. [`0006_customers_plans_audit.sql`](supabase/migrations/0006_customers_plans_audit.sql) — customer lifecycle fields, meal plans (`meal_plans` / `customer_meal_plans`), `audit_logs`, and request-lifecycle fields on `meal_requests`.
+7. [`0007_rls_plans_audit.sql`](supabase/migrations/0007_rls_plans_audit.sql) — RLS + per-owner policies for the meal-plan, customer-meal-plan and audit-log tables added in 0006.
+8. [`0008_chat_imports_history.sql`](supabase/migrations/0008_chat_imports_history.sql) — import history (`chat_imports`, `chat_messages`), duplicate tracking (`request_duplicates`) and import-linkage columns on `meal_requests` (+ RLS).
+9. [`0009_billing_foundation.sql`](supabase/migrations/0009_billing_foundation.sql) — `payments` and `monthly_bills` tables (+ RLS, indexes, and the `(owner_id, student_id, bill_month, bill_year)` unique key billing upserts on), plus billing entry types on `ledger_entries`.
+10. [`0010_meal_cutoff_settings.sql`](supabase/migrations/0010_meal_cutoff_settings.sql) — owner meal times + a request-cutoff window on `owner_profiles`, plus the fields the Edge Function uses to flag late requests.
 
 Prefer the CLI? With the [Supabase CLI](https://supabase.com/docs/guides/cli)
 linked to your project:
 
 ```bash
-supabase db push        # applies everything in supabase/migrations (0001–0005)
+supabase db push        # applies everything in supabase/migrations (0001 … 0010)
 ```
 
 ### c. Auth provider (email verification)
@@ -144,14 +158,17 @@ SUPABASE_ANON_KEY=YOUR-PUBLIC-ANON-KEY
 SUPABASE_EMAIL_REDIRECT_URL=https://kotamess-poc.vercel.app
 ```
 
-`.env` is git-ignored. If `SUPABASE_URL`/`SUPABASE_ANON_KEY` are missing the app
-shows a "Backend not configured" screen instead of crashing.
+**`.env` is for local development only.** It is git-ignored, never committed,
+and **not bundled as a build asset** — the app loads it best-effort at startup
+and simply falls back to `--dart-define` values when it is absent, so a clean
+build with no `.env` never fails. If `SUPABASE_URL`/`SUPABASE_ANON_KEY` resolve
+to nothing the app shows a "Backend not configured" screen instead of crashing.
 `SUPABASE_EMAIL_REDIRECT_URL` is optional — if blank, Supabase falls back to the
 project Site URL.
 
-> CI / release builds can skip the `.env` file and inject values with
+> **Release / CI builds should use `--dart-define`** instead of an `.env`:
 > `--dart-define=SUPABASE_URL=... --dart-define=SUPABASE_ANON_KEY=...
-> --dart-define=SUPABASE_EMAIL_REDIRECT_URL=...` instead.
+> --dart-define=SUPABASE_EMAIL_REDIRECT_URL=...`.
 
 ---
 
@@ -160,7 +177,8 @@ project Site URL.
 ```bash
 flutter clean
 flutter pub get
-flutter run -d 9T5XEM99LVPZW8CM   # the target Android device, or:
+flutter devices                   # list connected devices + their ids
+flutter run -d <device-id>        # run on a specific device, or:
 flutter run                       # pick any connected device
 ```
 
@@ -226,7 +244,7 @@ release later still needs:
 | `SUPABASE_EMAIL_REDIRECT_URL` | An HTTPS page you control, e.g. `https://kotamess-poc.vercel.app` | `.env` |
 | Email auth enabled + Confirm email ON | Supabase → Authentication → Providers → Email | dashboard toggle |
 | Site URL + Additional Redirect URLs | Supabase → Authentication → URL Configuration (must match the redirect URL) | dashboard |
-| Migrations applied | run `0001` → `0002` → `0003` → `0004` | SQL editor / `supabase db push` |
+| Migrations applied | run `0001` … `0010` in order | SQL editor / `supabase db push` |
 | `GEMINI_API_KEY` (+ optional `GEMINI_MODEL`) | Google AI Studio | **Supabase secret only** — never in `.env` |
 
 > Flutter `.env` holds **only** `SUPABASE_URL`, `SUPABASE_ANON_KEY`, and
@@ -280,10 +298,13 @@ the Flutter `.env`, never logged, and never returned to the client.
 
 ### e. Test from the app
 1. Sign in, open the **Import** tab.
-2. Tap **Insert sample** (or paste/import a chat), then **Extract requests**.
-3. Review the extracted cards; if the orange banner shows, the fallback parser
-   was used (set/redeploy the Gemini secret to use Gemini).
-4. **Save as pending requests** → you're taken to the **Requests** tab.
+2. Tap **Insert sample** (or **Choose .txt or .zip** / paste a chat), then
+   **Import & extract**.
+3. The server parses the chat, extracts requests and **saves them as pending**
+   `meal_requests`; the app shows an import summary. If the orange banner shows,
+   the fallback parser was used (set/redeploy the Gemini secret to use Gemini).
+4. Tap **Review _N_ request(s)** → you're taken to the **Requests** tab to
+   approve / reject them.
 
 ---
 
@@ -300,28 +321,39 @@ lib/
     sign_up_screen.dart                # one-time owner/mess/email/password form
     verify_email_screen.dart           # "verify your email" + resend
   profile/
-    owner_profile.dart                 # model for owner_profiles
+    owner_profile.dart                 # model for owner_profiles (counts, times, cutoff)
     owner_profile_service.dart         # load + idempotent upsert + metadata bootstrap
     complete_profile_screen.dart       # rare fallback when metadata is missing
   models/
     meal_request.dart                  # meal_requests row + label vocab
-    imported_message.dart              # imported_messages row
+    imported_message.dart              # legacy imported_messages row
+    chat_import.dart / chat_message.dart  # import-history rows (0008)
     extraction_result.dart             # Edge Function response models
-    daily_adjustment.dart              # daily_adjustments row
-    daily_summary.dart                 # computed daily count + counting rules
+    student.dart                       # students == customers (lifecycle fields)
+    meal_plan.dart                     # meal_plans + customer_meal_plans
+    payment.dart                       # payments row + CustomerBalance
+    monthly_bill.dart                  # monthly_bills row + the bill formula
+    audit_log.dart                     # audit_logs row
+    daily_adjustment.dart / daily_summary.dart  # per-date counts + counting rules
+    kitchen_summary.dart               # expected counts from active plans
     ledger_entry.dart                  # ledger_entries row + entry vocab
     dashboard.dart                     # dashboard summary + activity feed
   services/
     whatsapp_import.dart               # pick + read .txt / unzip .zip chat
-    extraction_service.dart            # calls extract-requests Edge Function
-    database_service.dart              # requests / students / daily / ledger / cleanup
+    extraction_service.dart            # calls extract-requests Edge Function (server saves)
+    database_service.dart              # requests / customers / plans / billing / cleanup
+    money_utils.dart / name_utils.dart # amount parsing + name normalization
   screens/
     home_screen.dart                   # dashboard: counts, tallies, quick actions, activity
-    chat_import_screen.dart            # paste/.txt/.zip -> extract -> save pending
+    chat_import_screen.dart            # paste/.txt/.zip -> import & extract (server saves pending)
+    import_history_screen.dart / import_detail_screen.dart  # past imports + their requests
     meal_requests_screen.dart          # filter/search/approve/reject/edit/delete
+    customers_screen.dart / customer_detail_screen.dart / customer_ledger_screen.dart
+    meal_plans_screen.dart             # create/assign subscription plans
+    monthly_bills_screen.dart          # generate + view monthly bills
     daily_screen.dart                  # per-date count, breakdown, manual adjustments
-    ledger_screen.dart                 # student-wise entries + totals + CRUD
-    settings_screen.dart               # profile, base counts, retention cleanup, logout
+    ledger_screen.dart                 # customer-wise entries + totals + CRUD
+    settings_screen.dart               # profile, base counts, cutoff, retention cleanup, logout
   widgets/
     confidence_badge.dart
     common.dart                        # shared cards / empty / error states
@@ -331,6 +363,12 @@ supabase/migrations/
   0002_rls.sql                         # Row Level Security policies
   0003_meal_requests_extraction.sql    # reshape meal_requests for extraction
   0004_dashboard_ledger.sql            # owner base counts + ledger reshape
+  0005_student_aliases_and_auto_ledger.sql  # aliases + at-most-one auto ledger entry
+  0006_customers_plans_audit.sql       # customer lifecycle, meal plans, audit logs
+  0007_rls_plans_audit.sql             # RLS for plans / customer plans / audit logs
+  0008_chat_imports_history.sql        # import history, messages, duplicate tracking
+  0009_billing_foundation.sql          # payments + monthly_bills (+ RLS, indexes)
+  0010_meal_cutoff_settings.sql        # owner meal times + request-cutoff window
 supabase/functions/
   extract-requests/index.ts            # Gemini extraction + rule-based fallback
 .env.example                           # Supabase URL/anon/redirect (NO Gemini key)
@@ -347,9 +385,10 @@ A clean 2-minute walkthrough:
    approved / import tallies, quick actions, recent activity.
 3. **Import** a WhatsApp chat: tap **Insert sample**, or **Choose .txt or .zip**
    and pick a real export.
-4. **Extract requests** — the Edge Function calls Gemini (orange banner means the
-   rule-based fallback ran instead).
-5. **Save** the extracted items as **pending requests** (jumps to Requests).
+4. **Import & extract** — the server calls Gemini and **saves the extracted
+   items as pending requests** (orange banner means the rule-based fallback ran
+   instead), then shows an import summary.
+5. Tap **Review request(s)** to jump to the Requests tab.
 6. **Review** pending requests; use the filters and search.
 7. **Approve** a couple and **reject** one.
 8. Open **Daily** → the approved cancellations/additions change the final lunch
@@ -359,7 +398,7 @@ A clean 2-minute walkthrough:
 10. Open **Ledger** → **Add entry**: a payment and a due note; see the totals and
     per-student balances update.
 11. Open **Settings** (gear, top-right) → adjust **base counts**, confirm the
-    **90-day retention** window, and try **Clean old imported messages**.
+    **retention** window, and try **Clean old import history**.
 
 ### Tip: set base counts first
 The Daily/Home totals start from `Settings → Default daily counts`. Set a base

@@ -106,11 +106,11 @@ supabase/.temp/
 *.ipr
 *.iws
 
-# VS Code is optional.
+# VS Code — ignore local editor config (only local CMake noise here).
 
-# Keep this commented if you want to share launch/tasks config.
+# Remove this line if you later add shared launch/tasks config to commit.
 
-#.vscode/
+.vscode/
 
 # =========================================================
 

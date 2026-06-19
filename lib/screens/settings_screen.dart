@@ -137,9 +137,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
       builder: (_) => AlertDialog(
         title: const Text('Clean old imports?'),
         content: Text(
-          'This permanently deletes imported WhatsApp chats older than '
-          '$retention days. Your students, meal requests, ledger and account '
-          'are not affected.',
+          'This permanently deletes old import history (imported WhatsApp chat '
+          'text) older than $retention days. Your customers, meal requests, '
+          'ledger, billing and account are not affected.',
         ),
         actions: [
           TextButton(
@@ -158,7 +158,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
           await widget.databaseService.cleanupOldImportedMessages(retention);
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Deleted $deleted old imported message(s).')),
+        SnackBar(content: Text('Deleted $deleted old import record(s).')),
       );
     } catch (_) {
       if (!mounted) return;
@@ -404,8 +404,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
               icon: Icons.auto_delete_outlined,
               children: [
                 const Text(
-                  'WhatsApp exports keep growing. Set how many days of imported '
-                  'chats to keep, then clean older ones to save space.',
+                  'WhatsApp exports keep growing. Set how many days of import '
+                  'history (imported chat text) to keep, then clean older ones '
+                  'to save space.',
                   style: TextStyle(color: Colors.black54, fontSize: 13),
                 ),
                 const SizedBox(height: 12),
@@ -429,7 +430,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                             width: 18,
                             child: CircularProgressIndicator(strokeWidth: 2))
                         : const Icon(Icons.cleaning_services_outlined),
-                    label: const Text('Clean old imported messages'),
+                    label: const Text('Clean old import history'),
                   ),
                 ),
               ],

@@ -23,5 +23,6 @@ dev_dependencies:
 
 flutter:
     uses-material-design: true
-    assets:
-        - .env
+    # No bundled assets. Local dev reads SUPABASE_* from an optional `.env`
+    # (loaded best-effort at startup, never committed); release/CI inject the
+    # same values with --dart-define. See README §2 / PRODUCTION_CHECKLIST.
