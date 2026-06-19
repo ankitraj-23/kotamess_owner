@@ -36,6 +36,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
   late final TextEditingController _lunch;
   late final TextEditingController _dinner;
   late final TextEditingController _retention;
+  late final TextEditingController _cutoffMinutes;
+
+  // Meal serving times, edited via the native time picker.
+  late TimeOfDay _breakfastTime;
+  late TimeOfDay _lunchTime;
+  late TimeOfDay _dinnerTime;
 
   bool _saving = false;
   bool _cleaning = false;
@@ -50,6 +56,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _lunch = TextEditingController(text: '${p.defaultLunchCount}');
     _dinner = TextEditingController(text: '${p.defaultDinnerCount}');
     _retention = TextEditingController(text: '${p.retentionDays}');
+    _cutoffMinutes = TextEditingController(text: '${p.requestCutoffMinutes}');
+    _breakfastTime = _parseTime(p.breakfastTime, const TimeOfDay(hour: 8, minute: 0));
+    _lunchTime = _parseTime(p.lunchTime, const TimeOfDay(hour: 13, minute: 0));
+    _dinnerTime = _parseTime(p.dinnerTime, const TimeOfDay(hour: 20, minute: 0));
   }
 
   @override
@@ -60,7 +70,31 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _lunch.dispose();
     _dinner.dispose();
     _retention.dispose();
+    _cutoffMinutes.dispose();
     super.dispose();
+  }
+
+  /// Parse a stored `'HH:mm'` string into a [TimeOfDay], using [fallback] for
+  /// null/garbage values.
+  TimeOfDay _parseTime(String hhmm, TimeOfDay fallback) {
+    final parts = hhmm.split(':');
+    if (parts.length >= 2) {
+      final h = int.tryParse(parts[0]);
+      final m = int.tryParse(parts[1]);
+      if (h != null && m != null && h >= 0 && h < 24 && m >= 0 && m < 60) {
+        return TimeOfDay(hour: h, minute: m);
+      }
+    }
+    return fallback;
+  }
+
+  /// Format a [TimeOfDay] as a 24-hour `'HH:mm'` string for storage.
+  String _formatTime(TimeOfDay t) =>
+      '${t.hour.toString().padLeft(2, '0')}:${t.minute.toString().padLeft(2, '0')}';
+
+  Future<void> _pickTime(TimeOfDay current, ValueChanged<TimeOfDay> onPicked) async {
+    final picked = await showTimePicker(context: context, initialTime: current);
+    if (picked != null) onPicked(picked);
   }
 
   Future<void> _save() async {
@@ -73,6 +107,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
       defaultLunchCount: int.parse(_lunch.text.trim()),
       defaultDinnerCount: int.parse(_dinner.text.trim()),
       retentionDays: int.parse(_retention.text.trim()),
+      breakfastTime: _formatTime(_breakfastTime),
+      lunchTime: _formatTime(_lunchTime),
+      dinnerTime: _formatTime(_dinnerTime),
+      requestCutoffMinutes: int.parse(_cutoffMinutes.text.trim()),
     );
     try {
       final saved = await widget.profileService.updateProfile(updated);
@@ -216,6 +254,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
     return null;
   }
 
+  String? _cutoffValidator(String? v) {
+    final n = int.tryParse((v ?? '').trim());
+    if (n == null) return 'Enter a number';
+    if (n < 0 || n > 360) return 'Use 0–360 minutes';
+    return null;
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -302,6 +347,54 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       ),
                     ),
                   ],
+                ),
+              ],
+            ),
+            const SizedBox(height: 16),
+            _SettingsCard(
+              title: 'Meal request cutoff',
+              icon: Icons.schedule_outlined,
+              children: [
+                const Text(
+                  'Set when each meal is served and how early students must '
+                  'send a change, cancel, add or delay request. Requests that '
+                  'arrive later than the cutoff are flagged for your review.',
+                  style: TextStyle(color: Colors.black54, fontSize: 13),
+                ),
+                const SizedBox(height: 12),
+                _TimeField(
+                  label: 'Breakfast time',
+                  icon: Icons.free_breakfast_outlined,
+                  time: _breakfastTime,
+                  onTap: () => _pickTime(
+                      _breakfastTime, (t) => setState(() => _breakfastTime = t)),
+                ),
+                const SizedBox(height: 12),
+                _TimeField(
+                  label: 'Lunch time',
+                  icon: Icons.lunch_dining,
+                  time: _lunchTime,
+                  onTap: () => _pickTime(
+                      _lunchTime, (t) => setState(() => _lunchTime = t)),
+                ),
+                const SizedBox(height: 12),
+                _TimeField(
+                  label: 'Dinner time',
+                  icon: Icons.dinner_dining,
+                  time: _dinnerTime,
+                  onTap: () => _pickTime(
+                      _dinnerTime, (t) => setState(() => _dinnerTime = t)),
+                ),
+                const SizedBox(height: 12),
+                TextFormField(
+                  controller: _cutoffMinutes,
+                  keyboardType: TextInputType.number,
+                  decoration: const InputDecoration(
+                    labelText: 'Cutoff minutes before meal (0–360)',
+                    helperText: 'Default 60 (1 hour before the meal)',
+                    prefixIcon: Icon(Icons.timer_outlined),
+                  ),
+                  validator: _cutoffValidator,
                 ),
               ],
             ),
@@ -511,6 +604,37 @@ class _SettingsCard extends StatelessWidget {
             ...children,
           ],
         ),
+      ),
+    );
+  }
+}
+
+/// A tappable, read-only field that shows a time and opens the native time
+/// picker on tap. Styled like the other [InputDecoration] fields on this screen.
+class _TimeField extends StatelessWidget {
+  const _TimeField({
+    required this.label,
+    required this.icon,
+    required this.time,
+    required this.onTap,
+  });
+
+  final String label;
+  final IconData icon;
+  final TimeOfDay time;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      onTap: onTap,
+      child: InputDecorator(
+        decoration: InputDecoration(
+          labelText: label,
+          prefixIcon: Icon(icon),
+          suffixIcon: const Icon(Icons.edit_outlined, size: 18),
+        ),
+        child: Text(time.format(context)),
       ),
     );
   }
