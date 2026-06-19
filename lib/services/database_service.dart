@@ -11,6 +11,7 @@ import '../models/kitchen_summary.dart';
 import '../models/ledger_entry.dart';
 import '../models/meal_plan.dart';
 import '../models/meal_request.dart';
+import '../models/payment.dart';
 import '../models/student.dart';
 import 'money_utils.dart';
 import 'name_utils.dart';
@@ -1285,6 +1286,169 @@ class DatabaseService {
         .delete()
         .eq('id', id)
         .eq('owner_id', ownerId);
+  }
+
+  // --- Payments & customer balances ---------------------------------------
+
+  /// Ledger entries for one customer, newest first. Unlike [fetchLedgerEntries]
+  /// (which matches by name), this filters by the canonical `student_id`.
+  Future<List<LedgerEntry>> fetchStudentLedgerEntries(String studentId) async {
+    final ownerId = getCurrentOwnerId();
+    final rows = await _client
+        .from('ledger_entries')
+        .select()
+        .eq('owner_id', ownerId)
+        .eq('student_id', studentId)
+        .order('entry_date', ascending: false)
+        .order('created_at', ascending: false);
+    return rows
+        .map((e) => LedgerEntry.fromJson(Map<String, dynamic>.from(e)))
+        .toList();
+  }
+
+  /// Payment rows, newest first. Scoped to one customer when [studentId] is set.
+  Future<List<Payment>> fetchPayments({String? studentId}) async {
+    final ownerId = getCurrentOwnerId();
+    var query = _client.from('payments').select().eq('owner_id', ownerId);
+    if (studentId != null) query = query.eq('student_id', studentId);
+    final rows = await query
+        .order('payment_date', ascending: false)
+        .order('created_at', ascending: false);
+    return rows
+        .map((e) => Payment.fromJson(Map<String, dynamic>.from(e)))
+        .toList();
+  }
+
+  /// Records a received payment against a customer. `owner_id` comes from the
+  /// authenticated session (never the caller); RLS enforces owner isolation.
+  Future<Payment> createPayment({
+    required String studentId,
+    required num amount,
+    String? paymentDate,
+    String? paymentMode,
+    String note = '',
+  }) async {
+    final ownerId = getCurrentOwnerId();
+    final row = await _client
+        .from('payments')
+        .insert({
+          'owner_id': ownerId,
+          'student_id': studentId,
+          'amount': amount,
+          'payment_date': paymentDate ?? _dateStr(DateTime.now()),
+          if (paymentMode != null) 'payment_mode': paymentMode,
+          'note': note.trim(),
+        })
+        .select()
+        .single();
+    final created = Payment.fromJson(Map<String, dynamic>.from(row));
+    await _writeAudit(
+      entityType: 'payment',
+      entityId: created.id,
+      action: 'payment_added',
+      newData: {
+        'student_id': studentId,
+        'amount': amount,
+        if (paymentMode != null) 'payment_mode': paymentMode,
+      },
+    );
+    return created;
+  }
+
+  /// Adds a manual balance adjustment as a `ledger_entries` row (entry_type
+  /// `manual_adjustment`). A positive amount increases what the customer owes;
+  /// a negative amount credits them. Reuses the existing `note` field for text.
+  Future<LedgerEntry> addManualAdjustment({
+    required String studentName,
+    String? studentId,
+    required int amount,
+    String description = '',
+    String? entryDate,
+  }) async {
+    final ownerId = getCurrentOwnerId();
+    final name = studentName.trim();
+    final resolvedId = studentId ??
+        (await _resolveStudentIds([name], ownerId))[_nameKey(name)];
+    final row = await _client
+        .from('ledger_entries')
+        .insert({
+          'owner_id': ownerId,
+          'student_id': resolvedId,
+          'student_name': name,
+          'entry_type': 'manual_adjustment',
+          'amount': amount,
+          'note': description.trim(),
+          'entry_date': entryDate ?? _dateStr(DateTime.now()),
+        })
+        .select()
+        .single();
+    final created = LedgerEntry.fromJson(Map<String, dynamic>.from(row));
+    await _writeAudit(
+      entityType: 'ledger_entry',
+      entityId: created.id,
+      action: 'manual_adjustment_added',
+      newData: {
+        if (resolvedId != null) 'student_id': resolvedId,
+        'amount': amount,
+        'note': description.trim(),
+      },
+    );
+    return created;
+  }
+
+  /// Per-customer money positions for active + paused customers, combining the
+  /// existing ledger convention with the payments table (see [CustomerBalance]).
+  Future<List<CustomerBalance>> fetchCustomerBalances({String? search}) async {
+    final ownerId = getCurrentOwnerId();
+    var cq = _client
+        .from('students')
+        .select()
+        .eq('owner_id', ownerId)
+        .inFilter('status', ['active', 'paused']);
+    final term = search?.trim() ?? '';
+    if (term.isNotEmpty) {
+      cq = cq.or('name.ilike.%$term%,phone.ilike.%$term%');
+    }
+    final customerRows = await cq.order('name');
+    final customers = customerRows
+        .map((e) => Student.fromJson(Map<String, dynamic>.from(e)))
+        .toList();
+    if (customers.isEmpty) return [];
+
+    final ids = customers.map((c) => c.id).toList();
+
+    final ledgerRows = await _client
+        .from('ledger_entries')
+        .select()
+        .eq('owner_id', ownerId)
+        .inFilter('student_id', ids);
+    final paymentRows = await _client
+        .from('payments')
+        .select()
+        .eq('owner_id', ownerId)
+        .inFilter('student_id', ids);
+
+    final entriesByStudent = <String, List<LedgerEntry>>{};
+    for (final r in ledgerRows) {
+      final e = LedgerEntry.fromJson(Map<String, dynamic>.from(r));
+      final sid = e.studentId;
+      if (sid == null) continue;
+      entriesByStudent.putIfAbsent(sid, () => []).add(e);
+    }
+    final paymentsByStudent = <String, List<Payment>>{};
+    for (final r in paymentRows) {
+      final p = Payment.fromJson(Map<String, dynamic>.from(r));
+      paymentsByStudent.putIfAbsent(p.studentId, () => []).add(p);
+    }
+
+    return [
+      for (final c in customers)
+        CustomerBalance.from(
+          c,
+          entriesByStudent[c.id] ?? const [],
+          paymentsByStudent[c.id] ?? const [],
+        ),
+    ];
   }
 
   // --- Retention / cleanup ------------------------------------------------

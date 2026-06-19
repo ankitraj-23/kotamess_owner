@@ -40,6 +40,8 @@ class AuditLog {
       'customer' => 'customer',
       'meal_plan' => 'meal plan',
       'customer_meal_plan' => 'plan assignment',
+      'payment' => 'payment',
+      'ledger_entry' => 'adjustment',
       _ => entityType.replaceAll('_', ' '),
     };
     final verb = switch (action) {
@@ -54,6 +56,7 @@ class AuditLog {
       'note' => 'Noted on',
       'assign_plan' => 'Assigned plan to',
       'status_change' => 'Changed status of',
+      'payment_added' || 'manual_adjustment_added' => 'Added',
       _ => '${action[0].toUpperCase()}${action.substring(1)} —',
     };
     return '$verb $entity';

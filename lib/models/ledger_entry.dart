@@ -75,6 +75,7 @@ class LedgerVocab {
       case 'charge':
         return 'Due';
       case 'adjustment':
+      case 'manual_adjustment':
         return 'Adjustment';
       default:
         return 'Note';

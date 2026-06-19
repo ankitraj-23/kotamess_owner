@@ -1,9 +1,11 @@
 import 'package:flutter/material.dart';
 
 import '../models/ledger_entry.dart';
+import '../models/payment.dart';
 import '../models/student.dart';
 import '../services/database_service.dart';
 import '../widgets/common.dart';
+import 'customer_ledger_screen.dart';
 
 /// Student ledger: manual payment/due/adjustment/note entries with search,
 /// type filter, summary totals and add/edit/delete.
@@ -18,10 +20,15 @@ class LedgerScreen extends StatefulWidget {
 
 class LedgerScreenState extends State<LedgerScreen> {
   final _search = TextEditingController();
+  String _view = 'balances'; // balances | entries
   String _filter = 'all'; // all | payment | due | adjustment | note
   bool _loading = true;
   String? _error;
   List<LedgerEntry> _entries = [];
+
+  bool _balLoading = true;
+  String? _balError;
+  List<CustomerBalance> _balances = [];
 
   @override
   void initState() {
@@ -35,7 +42,9 @@ class LedgerScreenState extends State<LedgerScreen> {
     super.dispose();
   }
 
+  /// Reloads whichever view is currently active (also called on tab switch).
   Future<void> reload() async {
+    if (_view == 'balances') return _loadBalances();
     if (mounted) setState(() => _error = null);
     try {
       final entries = await widget.databaseService.fetchLedgerEntries(
@@ -54,6 +63,44 @@ class LedgerScreenState extends State<LedgerScreen> {
         _loading = false;
       });
     }
+  }
+
+  Future<void> _loadBalances() async {
+    if (mounted) setState(() => _balError = null);
+    try {
+      final list = await widget.databaseService
+          .fetchCustomerBalances(search: _search.text);
+      if (!mounted) return;
+      setState(() {
+        _balances = list;
+        _balLoading = false;
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _balError = 'Could not load customer balances.';
+        _balLoading = false;
+      });
+    }
+  }
+
+  void _setView(String v) {
+    if (v == _view) return;
+    setState(() => _view = v);
+    reload();
+  }
+
+  Future<void> _openCustomer(CustomerBalance b) async {
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => CustomerLedgerScreen(
+          databaseService: widget.databaseService,
+          student: b.student,
+        ),
+      ),
+    );
+    // A payment/adjustment may have changed the balance while inside.
+    _loadBalances();
   }
 
   void _setFilter(String f) {
@@ -123,13 +170,16 @@ class LedgerScreenState extends State<LedgerScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final isEntries = _view == 'entries';
     return Scaffold(
       backgroundColor: Colors.transparent,
-      floatingActionButton: FloatingActionButton.extended(
-        onPressed: () => _addOrEdit(),
-        icon: const Icon(Icons.add),
-        label: const Text('Add entry'),
-      ),
+      floatingActionButton: isEntries
+          ? FloatingActionButton.extended(
+              onPressed: () => _addOrEdit(),
+              icon: const Icon(Icons.add),
+              label: const Text('Add entry'),
+            )
+          : null,
       body: Column(
         children: [
           Padding(
@@ -137,43 +187,64 @@ class LedgerScreenState extends State<LedgerScreen> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Row(
-                  children: [
-                    Expanded(
-                      child: _SummaryCard(
-                        label: 'Payments',
-                        value: '₹$_totalPayments',
-                        color: const Color(0xFF16A34A),
-                        icon: Icons.south_west,
-                      ),
+                SegmentedButton<String>(
+                  segments: const [
+                    ButtonSegment(
+                      value: 'balances',
+                      label: Text('Balances'),
+                      icon: Icon(Icons.people_alt_outlined),
                     ),
-                    const SizedBox(width: 10),
-                    Expanded(
-                      child: _SummaryCard(
-                        label: 'Dues',
-                        value: '₹$_totalDues',
-                        color: const Color(0xFFDC2626),
-                        icon: Icons.north_east,
-                      ),
-                    ),
-                    const SizedBox(width: 10),
-                    Expanded(
-                      child: _SummaryCard(
-                        label: 'Net',
-                        value: '₹${_totalPayments - _totalDues}',
-                        color: const Color(0xFF2563EB),
-                        icon: Icons.account_balance,
-                      ),
+                    ButtonSegment(
+                      value: 'entries',
+                      label: Text('Entries'),
+                      icon: Icon(Icons.receipt_long_outlined),
                     ),
                   ],
+                  selected: {_view},
+                  onSelectionChanged: (s) => _setView(s.first),
                 ),
                 const SizedBox(height: 12),
+                if (isEntries) ...[
+                  Row(
+                    children: [
+                      Expanded(
+                        child: _SummaryCard(
+                          label: 'Payments',
+                          value: '₹$_totalPayments',
+                          color: const Color(0xFF16A34A),
+                          icon: Icons.south_west,
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: _SummaryCard(
+                          label: 'Dues',
+                          value: '₹$_totalDues',
+                          color: const Color(0xFFDC2626),
+                          icon: Icons.north_east,
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: _SummaryCard(
+                          label: 'Net',
+                          value: '₹${_totalPayments - _totalDues}',
+                          color: const Color(0xFF2563EB),
+                          icon: Icons.account_balance,
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 12),
+                ],
                 TextField(
                   controller: _search,
                   textInputAction: TextInputAction.search,
                   onSubmitted: (_) => reload(),
                   decoration: InputDecoration(
-                    hintText: 'Search by student name',
+                    hintText: isEntries
+                        ? 'Search by student name'
+                        : 'Search customers by name or phone',
                     prefixIcon: const Icon(Icons.search),
                     suffixIcon: _search.text.isEmpty
                         ? null
@@ -189,24 +260,55 @@ class LedgerScreenState extends State<LedgerScreen> {
                         borderRadius: BorderRadius.circular(14)),
                   ),
                 ),
-                const SizedBox(height: 10),
-                SingleChildScrollView(
-                  scrollDirection: Axis.horizontal,
-                  child: Row(
-                    children: [
-                      _chip('All', 'all'),
-                      _chip('Payment', 'payment'),
-                      _chip('Due', 'due'),
-                      _chip('Adjustment', 'adjustment'),
-                      _chip('Note', 'note'),
-                    ],
+                if (isEntries) ...[
+                  const SizedBox(height: 10),
+                  SingleChildScrollView(
+                    scrollDirection: Axis.horizontal,
+                    child: Row(
+                      children: [
+                        _chip('All', 'all'),
+                        _chip('Payment', 'payment'),
+                        _chip('Due', 'due'),
+                        _chip('Adjustment', 'adjustment'),
+                        _chip('Note', 'note'),
+                      ],
+                    ),
                   ),
-                ),
+                ],
               ],
             ),
           ),
-          Expanded(child: _buildBody()),
+          Expanded(child: isEntries ? _buildBody() : _buildBalances()),
         ],
+      ),
+    );
+  }
+
+  Widget _buildBalances() {
+    if (_balLoading) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    if (_balError != null) {
+      return AppErrorState(message: _balError!, onRetry: _loadBalances);
+    }
+    if (_balances.isEmpty) {
+      return AppEmptyState(
+        icon: Icons.people_outline,
+        title: 'No customers',
+        message: _search.text.isNotEmpty
+            ? 'No active or paused customers match this search.'
+            : 'Active and paused customers will appear here with their balances.',
+      );
+    }
+    return RefreshIndicator(
+      onRefresh: _loadBalances,
+      child: ListView.builder(
+        padding: const EdgeInsets.fromLTRB(16, 12, 16, 96),
+        itemCount: _balances.length,
+        itemBuilder: (_, i) => _BalanceTile(
+          balance: _balances[i],
+          onTap: () => _openCustomer(_balances[i]),
+        ),
       ),
     );
   }
@@ -303,6 +405,62 @@ class _SummaryCard extends StatelessWidget {
             ),
             Text(label,
                 style: TextStyle(color: Colors.grey.shade600, fontSize: 12)),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// One customer row in the Balances view: name, phone and money position.
+class _BalanceTile extends StatelessWidget {
+  const _BalanceTile({required this.balance, required this.onTap});
+  final CustomerBalance balance;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final settled = balance.balance == 0;
+    final color = settled
+        ? const Color(0xFF2563EB)
+        : balance.owes
+            ? const Color(0xFFDC2626)
+            : const Color(0xFF16A34A);
+    final trailing = settled
+        ? 'Settled'
+        : balance.owes
+            ? '₹${formatMoney(balance.balance)} due'
+            : '₹${formatMoney(balance.balance.abs())} cr';
+    final name = balance.student.name;
+    return Card(
+      margin: const EdgeInsets.only(bottom: 10),
+      child: ListTile(
+        onTap: onTap,
+        leading: CircleAvatar(
+          child: Text(name.isEmpty ? '?' : name[0].toUpperCase()),
+        ),
+        title: Text(name,
+            style: const TextStyle(fontWeight: FontWeight.w800)),
+        subtitle: Text(
+          [
+            if (balance.student.phone.isNotEmpty) balance.student.phone,
+            'Charges ₹${formatMoney(balance.totalCharges)}',
+            'Paid ₹${formatMoney(balance.totalPayments)}',
+          ].join(' · '),
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+        ),
+        trailing: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          crossAxisAlignment: CrossAxisAlignment.end,
+          children: [
+            Text(trailing,
+                style: TextStyle(fontWeight: FontWeight.w800, color: color)),
+            if (balance.student.status == 'paused')
+              const Padding(
+                padding: EdgeInsets.only(top: 2),
+                child: InfoPill('Paused', color: Color(0xFFB45309)),
+              ),
           ],
         ),
       ),
