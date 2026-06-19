@@ -6,6 +6,7 @@ import '../models/student.dart';
 import '../services/database_service.dart';
 import '../widgets/common.dart';
 import 'customer_ledger_screen.dart';
+import 'monthly_bills_screen.dart';
 
 /// Student ledger: manual payment/due/adjustment/note entries with search,
 /// type filter, summary totals and add/edit/delete.
@@ -108,6 +109,15 @@ class LedgerScreenState extends State<LedgerScreen> {
     reload();
   }
 
+  void _openMonthlyBills() {
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) =>
+            MonthlyBillsScreen(databaseService: widget.databaseService),
+      ),
+    );
+  }
+
   Future<void> _addOrEdit([LedgerEntry? existing]) async {
     final saved = await showModalBottomSheet<bool>(
       context: context,
@@ -204,6 +214,24 @@ class LedgerScreenState extends State<LedgerScreen> {
                   onSelectionChanged: (s) => _setView(s.first),
                 ),
                 const SizedBox(height: 12),
+                if (!isEntries) ...[
+                  Card(
+                    margin: EdgeInsets.zero,
+                    child: ListTile(
+                      onTap: _openMonthlyBills,
+                      leading: const CircleAvatar(
+                        backgroundColor: Color(0xFFEFF6FF),
+                        child: Icon(Icons.receipt_long_outlined,
+                            color: Color(0xFF2563EB)),
+                      ),
+                      title: const Text('Monthly bills',
+                          style: TextStyle(fontWeight: FontWeight.w800)),
+                      subtitle: const Text('Generate and track monthly bills'),
+                      trailing: const Icon(Icons.chevron_right),
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                ],
                 if (isEntries) ...[
                   Row(
                     children: [

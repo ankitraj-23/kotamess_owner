@@ -11,6 +11,7 @@ import '../models/kitchen_summary.dart';
 import '../models/ledger_entry.dart';
 import '../models/meal_plan.dart';
 import '../models/meal_request.dart';
+import '../models/monthly_bill.dart';
 import '../models/payment.dart';
 import '../models/student.dart';
 import 'money_utils.dart';
@@ -1449,6 +1450,203 @@ class DatabaseService {
           paymentsByStudent[c.id] ?? const [],
         ),
     ];
+  }
+
+  // --- Monthly bills ------------------------------------------------------
+
+  /// First day of [month]/[year] and of the following month, as 'YYYY-MM-DD'
+  /// bounds for a half-open `[start, next)` range over the date columns.
+  ({String start, String next}) _monthRange(int month, int year) {
+    String two(int v) => v.toString().padLeft(2, '0');
+    final nextMonth = month == 12 ? 1 : month + 1;
+    final nextYear = month == 12 ? year + 1 : year;
+    return (
+      start: '${year.toString().padLeft(4, '0')}-${two(month)}-01',
+      next: '${nextYear.toString().padLeft(4, '0')}-${two(nextMonth)}-01',
+    );
+  }
+
+  /// Generated bills for [month]/[year], customer name/phone joined in, ordered
+  /// by name. Owner-scoped.
+  Future<List<MonthlyBill>> fetchMonthlyBills({
+    required int month,
+    required int year,
+  }) async {
+    final ownerId = getCurrentOwnerId();
+    final rows = await _client
+        .from('monthly_bills')
+        .select('*, students(name, phone)')
+        .eq('owner_id', ownerId)
+        .eq('bill_month', month)
+        .eq('bill_year', year);
+    final bills = rows
+        .map((e) => MonthlyBill.fromJson(Map<String, dynamic>.from(e)))
+        .toList()
+      ..sort((a, b) =>
+          a.studentName.toLowerCase().compareTo(b.studentName.toLowerCase()));
+    return bills;
+  }
+
+  /// The month's ledger entries + payments for one customer, newest first.
+  /// Powers the bill-detail breakdown using the same inputs as [compute].
+  Future<({List<LedgerEntry> entries, List<Payment> payments})>
+      fetchBillBreakdown({
+    required String studentId,
+    required int month,
+    required int year,
+  }) async {
+    final ownerId = getCurrentOwnerId();
+    final range = _monthRange(month, year);
+    final ledgerRows = await _client
+        .from('ledger_entries')
+        .select()
+        .eq('owner_id', ownerId)
+        .eq('student_id', studentId)
+        .gte('entry_date', range.start)
+        .lt('entry_date', range.next)
+        .order('entry_date', ascending: false)
+        .order('created_at', ascending: false);
+    final paymentRows = await _client
+        .from('payments')
+        .select()
+        .eq('owner_id', ownerId)
+        .eq('student_id', studentId)
+        .gte('payment_date', range.start)
+        .lt('payment_date', range.next)
+        .order('payment_date', ascending: false)
+        .order('created_at', ascending: false);
+    return (
+      entries: ledgerRows
+          .map((e) => LedgerEntry.fromJson(Map<String, dynamic>.from(e)))
+          .toList(),
+      payments: paymentRows
+          .map((e) => Payment.fromJson(Map<String, dynamic>.from(e)))
+          .toList(),
+    );
+  }
+
+  /// Computes and upserts monthly bills for [month]/[year]. With [studentId]
+  /// set, generates that one customer's bill; otherwise every active or paused
+  /// customer. Re-running is safe — the (owner, student, month, year) unique key
+  /// makes this an update-in-place, never a duplicate. Returns the saved bills.
+  Future<List<MonthlyBill>> generateMonthlyBills({
+    required int month,
+    required int year,
+    String? studentId,
+  }) async {
+    final ownerId = getCurrentOwnerId();
+
+    var customerQuery =
+        _client.from('students').select().eq('owner_id', ownerId);
+    if (studentId != null) {
+      customerQuery = customerQuery.eq('id', studentId);
+    } else {
+      customerQuery = customerQuery.inFilter('status', ['active', 'paused']);
+    }
+    final customers = (await customerQuery)
+        .map((e) => Student.fromJson(Map<String, dynamic>.from(e)))
+        .toList();
+    if (customers.isEmpty) return [];
+    final ids = customers.map((c) => c.id).toList();
+    final range = _monthRange(month, year);
+
+    // Batch the three inputs once for the whole set, then compute per customer.
+    final planRows = await _client
+        .from('customer_meal_plans')
+        .select('student_id, meal_plans(monthly_price)')
+        .eq('owner_id', ownerId)
+        .eq('is_active', true)
+        .inFilter('student_id', ids);
+    final baseByStudent = <String, num>{};
+    for (final r in planRows) {
+      final plan = r['meal_plans'];
+      baseByStudent[r['student_id'] as String] =
+          plan is Map ? (plan['monthly_price'] as num? ?? 0) : 0;
+    }
+
+    final ledgerRows = await _client
+        .from('ledger_entries')
+        .select()
+        .eq('owner_id', ownerId)
+        .inFilter('student_id', ids)
+        .gte('entry_date', range.start)
+        .lt('entry_date', range.next);
+    final entriesByStudent = <String, List<LedgerEntry>>{};
+    for (final r in ledgerRows) {
+      final e = LedgerEntry.fromJson(Map<String, dynamic>.from(r));
+      if (e.studentId == null) continue;
+      entriesByStudent.putIfAbsent(e.studentId!, () => []).add(e);
+    }
+
+    final paymentRows = await _client
+        .from('payments')
+        .select()
+        .eq('owner_id', ownerId)
+        .inFilter('student_id', ids)
+        .gte('payment_date', range.start)
+        .lt('payment_date', range.next);
+    final paymentsByStudent = <String, List<Payment>>{};
+    for (final r in paymentRows) {
+      final p = Payment.fromJson(Map<String, dynamic>.from(r));
+      paymentsByStudent.putIfAbsent(p.studentId, () => []).add(p);
+    }
+
+    // Which customers already had a bill, so we can audit generated vs updated.
+    final existingRows = await _client
+        .from('monthly_bills')
+        .select('student_id')
+        .eq('owner_id', ownerId)
+        .eq('bill_month', month)
+        .eq('bill_year', year)
+        .inFilter('student_id', ids);
+    final existing =
+        existingRows.map((e) => e['student_id'] as String).toSet();
+
+    final computed = [
+      for (final c in customers)
+        MonthlyBill.compute(
+          studentId: c.id,
+          studentName: c.name,
+          studentPhone: c.phone,
+          month: month,
+          year: year,
+          baseAmount: baseByStudent[c.id] ?? 0,
+          monthEntries: entriesByStudent[c.id] ?? const [],
+          monthPayments: paymentsByStudent[c.id] ?? const [],
+        ),
+    ];
+
+    final saved = await _client
+        .from('monthly_bills')
+        .upsert(
+          computed.map((b) => b.toUpsert(ownerId)).toList(),
+          onConflict: 'owner_id,student_id,bill_month,bill_year',
+        )
+        .select('*, students(name, phone)');
+    final savedBills = saved
+        .map((e) => MonthlyBill.fromJson(Map<String, dynamic>.from(e)))
+        .toList();
+
+    for (final b in savedBills) {
+      await _writeAudit(
+        entityType: 'monthly_bill',
+        entityId: b.id,
+        action: existing.contains(b.studentId)
+            ? 'monthly_bill_updated'
+            : 'monthly_bill_generated',
+        newData: {
+          'student_id': b.studentId,
+          'bill_month': month,
+          'bill_year': year,
+          'final_amount': b.finalAmount,
+          'status': b.status,
+        },
+      );
+    }
+
+    savedBills.sort((a, b) =>
+        a.studentName.toLowerCase().compareTo(b.studentName.toLowerCase()));
+    return savedBills;
   }
 
   // --- Retention / cleanup ------------------------------------------------
