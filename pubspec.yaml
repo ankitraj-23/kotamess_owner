@@ -1,27 +1,27 @@
 name: kotamess_owner
 description: Native Flutter APK for KotaMess owner-side WhatsApp request management.
-publish_to: 'none'
-version: 1.0.0+1
+publish_to: "none"
+version: 1.0.1+2
 
 environment:
-  sdk: '>=3.4.0 <4.0.0'
+    sdk: ">=3.4.0 <4.0.0"
 
 dependencies:
-  flutter:
-    sdk: flutter
-  cupertino_icons: ^1.0.8
-  file_picker: 10.3.8
-  shared_preferences: ^2.3.2
-  supabase_flutter: ^2.8.0
-  flutter_dotenv: ^5.2.1
-  archive: ^3.6.1
+    flutter:
+        sdk: flutter
+    cupertino_icons: ^1.0.8
+    file_picker: 10.3.8
+    shared_preferences: ^2.3.2
+    supabase_flutter: ^2.8.0
+    flutter_dotenv: ^5.2.1
+    archive: ^3.6.1
 
 dev_dependencies:
-  flutter_test:
-    sdk: flutter
-  flutter_lints: ^5.0.0
+    flutter_test:
+        sdk: flutter
+    flutter_lints: ^5.0.0
 
 flutter:
-  uses-material-design: true
-  assets:
-    - .env
+    uses-material-design: true
+    assets:
+        - .env
