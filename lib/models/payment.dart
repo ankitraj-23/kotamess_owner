@@ -86,6 +86,13 @@ class CustomerBalance {
   bool get owes => balance > 0;
   bool get inCredit => balance < 0;
 
+  /// Copyable reminder text for the customer's outstanding balance.
+  String reminderMessage() {
+    final name = student.name.trim().isEmpty ? 'there' : student.name.trim();
+    return 'Hi $name, your pending mess balance is ₹${formatMoney(balance)}. '
+        'Please clear it soon.';
+  }
+
   /// Charge contribution of a single ledger entry. A `payment`-type ledger row
   /// counts as a payment (see [paymentOf]); everything else uses the existing
   /// signed convention where the raw amount adds to what the customer owes.

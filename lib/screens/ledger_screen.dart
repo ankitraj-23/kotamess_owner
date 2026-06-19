@@ -1,9 +1,11 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../models/ledger_entry.dart';
 import '../models/payment.dart';
 import '../models/student.dart';
 import '../services/database_service.dart';
+import '../utils/csv.dart';
 import '../widgets/common.dart';
 import 'customer_ledger_screen.dart';
 import 'monthly_bills_screen.dart';
@@ -83,6 +85,30 @@ class LedgerScreenState extends State<LedgerScreen> {
         _balLoading = false;
       });
     }
+  }
+
+  /// Copies the loaded customer balances to the clipboard as CSV.
+  Future<void> _exportBalancesCsv() async {
+    if (_balances.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('No data to export')));
+      return;
+    }
+    final rows = <List<Object?>>[
+      ['customer_name', 'phone', 'total_charges', 'total_payments', 'balance'],
+      for (final b in _balances)
+        [
+          b.student.name,
+          b.student.phone,
+          formatMoney(b.totalCharges),
+          formatMoney(b.totalPayments),
+          formatMoney(b.balance),
+        ],
+    ];
+    await Clipboard.setData(ClipboardData(text: rowsToCsv(rows)));
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Copied to clipboard')));
   }
 
   void _setView(String v) {
@@ -189,7 +215,13 @@ class LedgerScreenState extends State<LedgerScreen> {
               icon: const Icon(Icons.add),
               label: const Text('Add entry'),
             )
-          : null,
+          : (_balLoading || _balError != null
+              ? null
+              : FloatingActionButton.extended(
+                  onPressed: _exportBalancesCsv,
+                  icon: const Icon(Icons.download_outlined),
+                  label: const Text('Export CSV'),
+                )),
       body: Column(
         children: [
           Padding(

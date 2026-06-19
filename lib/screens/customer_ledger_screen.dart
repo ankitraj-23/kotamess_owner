@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../models/ledger_entry.dart';
 import '../models/payment.dart';
@@ -97,10 +98,27 @@ class _CustomerLedgerScreenState extends State<CustomerLedgerScreen> {
     }
   }
 
+  /// Copies the customer's outstanding-balance reminder to the clipboard.
+  Future<void> _copyBalanceMessage() async {
+    await Clipboard.setData(ClipboardData(text: _balance.reminderMessage()));
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Copied to clipboard')));
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: Text(widget.student.name)),
+      appBar: AppBar(
+        title: Text(widget.student.name),
+        actions: [
+          IconButton(
+            tooltip: 'Copy balance message',
+            onPressed: _loading ? null : _copyBalanceMessage,
+            icon: const Icon(Icons.copy),
+          ),
+        ],
+      ),
       body: _buildBody(),
     );
   }

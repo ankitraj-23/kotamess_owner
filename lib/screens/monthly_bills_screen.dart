@@ -5,6 +5,7 @@ import '../models/ledger_entry.dart';
 import '../models/monthly_bill.dart';
 import '../models/payment.dart';
 import '../services/database_service.dart';
+import '../utils/csv.dart';
 import '../widgets/common.dart';
 
 /// Status → accent colour, shared by the list and detail views.
@@ -162,6 +163,48 @@ class _MonthlyBillsScreenState extends State<MonthlyBillsScreen> {
     }
   }
 
+  /// Copies the current month's bills to the clipboard as CSV.
+  Future<void> _exportCsv() async {
+    if (_bills.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('No data to export')));
+      return;
+    }
+    final rows = <List<Object?>>[
+      [
+        'customer_name',
+        'phone',
+        'bill_month',
+        'bill_year',
+        'base_amount',
+        'extra_amount',
+        'credit_amount',
+        'adjustment_amount',
+        'paid_amount',
+        'final_amount',
+        'status',
+      ],
+      for (final b in _bills)
+        [
+          b.studentName,
+          b.studentPhone,
+          b.billMonth,
+          b.billYear,
+          formatMoney(b.baseAmount),
+          formatMoney(b.extraAmount),
+          formatMoney(b.creditAmount),
+          formatMoney(b.adjustmentAmount),
+          formatMoney(b.paidAmount),
+          formatMoney(b.finalAmount),
+          b.status,
+        ],
+    ];
+    await Clipboard.setData(ClipboardData(text: rowsToCsv(rows)));
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Copied to clipboard')));
+  }
+
   Future<void> _openBill(MonthlyBill bill) async {
     await Navigator.of(context).push(
       MaterialPageRoute(
@@ -179,7 +222,16 @@ class _MonthlyBillsScreenState extends State<MonthlyBillsScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Monthly bills')),
+      appBar: AppBar(
+        title: const Text('Monthly bills'),
+        actions: [
+          IconButton(
+            tooltip: 'Export CSV',
+            onPressed: _loading ? null : _exportCsv,
+            icon: const Icon(Icons.download_outlined),
+          ),
+        ],
+      ),
       body: Column(
         children: [
           Padding(
