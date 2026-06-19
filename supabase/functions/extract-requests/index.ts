@@ -245,8 +245,14 @@ serve(async (req: Request): Promise<Response> => {
     );
 
     // --- Duplicate detection (deterministic, no embeddings) ------------
-    // Key = customer + meal + action(request_type) + date. Match against
-    // recent existing requests, then against earlier rows in this batch.
+    // Identity is student-aware:
+    //   linked   (student_id present) -> student_id + action + meal + date, so
+    //            two different people who share a name never collide.
+    //   unlinked (student_id null / ambiguous) -> sender + action + meal + date
+    //            + EXACT original message, so two different unlinked "Amit"s
+    //            with different messages are NOT flagged; only a re-import of
+    //            the same message is. Match against recent existing requests,
+    //            then against earlier rows in this batch.
     const existingByKey = await loadExistingDupKeys(supabase, ownerId);
     const batchFirstIndexByKey = new Map<string, number>();
 
@@ -254,30 +260,35 @@ serve(async (req: Request): Promise<Response> => {
       index: number;
       duplicateOf: string | null; // existing meal_requests.id, or null = within-batch
       batchIndex: number | null; // earlier index in this batch, or null = existing
+      linked: boolean; // true = matched on student_id; false = matched on exact message
     }
     const dupPlans: PendingDup[] = [];
 
     const rows = requests.map((r, i) => {
       const sKey = nameKey(r.studentName);
       const isAmbiguous = ambiguousKeys.has(sKey);
-      const key = dupKey(sKey, r);
+      const linkedId = studentIds.get(sKey) ?? null;
+      // Confidently linked -> identity is the student_id. Unlinked / ambiguous
+      // -> identity requires the exact original message (see key helpers).
+      const linked = linkedId !== null;
+      const key = linked ? linkedDupKey(linkedId, r) : unlinkedDupKey(sKey, r);
       let duplicateStatus = "unique";
 
       const existingId = existingByKey.get(key);
       const earlierIndex = batchFirstIndexByKey.get(key);
       if (existingId) {
         duplicateStatus = "possible_duplicate";
-        dupPlans.push({ index: i, duplicateOf: existingId, batchIndex: null });
+        dupPlans.push({ index: i, duplicateOf: existingId, batchIndex: null, linked });
       } else if (earlierIndex !== undefined) {
         duplicateStatus = "possible_duplicate";
-        dupPlans.push({ index: i, duplicateOf: null, batchIndex: earlierIndex });
+        dupPlans.push({ index: i, duplicateOf: null, batchIndex: earlierIndex, linked });
       } else {
         batchFirstIndexByKey.set(key, i);
       }
 
       return {
         owner_id: ownerId,
-        student_id: studentIds.get(sKey) ?? null,
+        student_id: linkedId,
         student_name: r.studentName,
         original_message: r.originalMessage,
         request_type: r.requestType,
@@ -316,7 +327,9 @@ serve(async (req: Request): Promise<Response> => {
             owner_id: ownerId,
             request_id: insertedIds[p.index],
             duplicate_of_request_id: dupOf,
-            reason: "Same customer, meal, action and date as an earlier request.",
+            reason: p.linked
+              ? "Same customer, meal, action and date as an earlier request."
+              : "Identical message from the same sender as an earlier request (unlinked).",
             similarity_score: 1.0,
           };
         })
@@ -569,9 +582,27 @@ async function resolveStudentIds(
 // ---------------------------------------------------------------------------
 // Duplicate detection
 // ---------------------------------------------------------------------------
-function dupKey(studentKey: string, r: ExtractedRequest): string {
+// Duplicate identity keys. `sid|`- and `msg|`-prefixed keys share one map but
+// can never collide, so a linked request and an unlinked request are always
+// compared on the appropriate (different) evidence.
+
+// Strong, confident identity: the request is linked to a real customer. Two
+// people who merely share a name have different student_ids and never collide,
+// while the same customer re-sending the same meal/action/date is caught.
+function linkedDupKey(studentId: string, r: ExtractedRequest): string {
   const dateKey = r.requestDate ?? r.dateLabel ?? "";
-  return [studentKey, r.requestType, r.mealType, dateKey].join("|");
+  return ["sid", studentId, r.requestType, r.mealType, dateKey].join("|");
+}
+
+// Conservative identity for unlinked / ambiguous requests: requires the EXACT
+// same original message from the same sender (plus action/meal/date). Two
+// different unlinked "Amit"s with different messages hash differently and are
+// NOT treated as duplicates; only a re-import of the same message matches.
+function unlinkedDupKey(senderKey: string, r: ExtractedRequest): string {
+  const dateKey = r.requestDate ?? r.dateLabel ?? "";
+  const msgNorm = (r.originalMessage ?? "").toLowerCase().replace(/\s+/g, " ").trim();
+  const msgHash = simpleHash(msgNorm);
+  return ["msg", senderKey, r.requestType, r.mealType, dateKey, msgHash].join("|");
 }
 
 async function loadExistingDupKeys(
@@ -581,22 +612,28 @@ async function loadExistingDupKeys(
   const map = new Map<string, string>();
   const { data } = await supabase
     .from("meal_requests")
-    .select("id, student_name, request_type, meal_type, request_date, date_label")
+    .select("id, student_id, student_name, original_message, request_type, meal_type, request_date, date_label")
     .eq("owner_id", ownerId)
     .in("status", ["pending", "approved"])
     .order("created_at", { ascending: false })
     .limit(1000);
   for (const row of data ?? []) {
-    const key = dupKey(nameKey((row.student_name as string) ?? ""), {
+    const r: ExtractedRequest = {
       studentName: "",
-      originalMessage: "",
+      originalMessage: (row.original_message as string) ?? "",
       requestType: (row.request_type as string) ?? "unclear",
       mealType: (row.meal_type as string) ?? "none",
       dateLabel: (row.date_label as string) ?? "",
       requestDate: (row.request_date as string) ?? null,
       confidence: 0,
       reason: "",
-    });
+    };
+    // Build the same student-aware key the new rows use: linked existing rows
+    // key on student_id, unlinked existing rows key on sender + exact message.
+    const sid = (row.student_id as string) ?? null;
+    const key = sid
+      ? linkedDupKey(sid, r)
+      : unlinkedDupKey(nameKey((row.student_name as string) ?? ""), r);
     if (!map.has(key)) map.set(key, row.id as string); // newest wins
   }
   return map;
