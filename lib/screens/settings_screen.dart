@@ -177,6 +177,27 @@ class _SettingsScreenState extends State<SettingsScreen> {
     }
   }
 
+  Future<void> _requestAccountDeletion() async {
+    await showDialog<void>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text('Request account deletion'),
+        content: const Text(
+          'Account deletion is not automated yet. To delete your account and '
+          'all associated data (imports, requests, customers, billing and '
+          'payments), please contact support / your admin and it will be '
+          'removed for you.',
+        ),
+        actions: [
+          FilledButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('OK'),
+          ),
+        ],
+      ),
+    );
+  }
+
   String? _notEmpty(String? v, String field) =>
       (v == null || v.trim().isEmpty) ? 'Enter $field' : null;
 
@@ -405,6 +426,45 @@ class _SettingsScreenState extends State<SettingsScreen> {
               ],
             ),
             const SizedBox(height: 16),
+            _SettingsCard(
+              title: 'Privacy & Data',
+              icon: Icons.privacy_tip_outlined,
+              children: [
+                const _BulletPoint(
+                  'Imported chat text is used only to extract meal requests — '
+                  'nothing else.',
+                ),
+                const _BulletPoint(
+                  'Chat imports, extracted requests, customers, billing records '
+                  'and payments are stored in your own Supabase account data.',
+                ),
+                const _BulletPoint(
+                  'The Gemini / AI key stays server-side as a Supabase Edge '
+                  'Function secret — it is never shipped in the app.',
+                ),
+                const _BulletPoint(
+                  'You can export your records any time using the CSV export '
+                  'options on the Requests and Ledger screens.',
+                ),
+                const _BulletPoint(
+                  'You can request deletion of your account and all associated '
+                  'data at any time.',
+                ),
+                const SizedBox(height: 12),
+                SizedBox(
+                  width: double.infinity,
+                  child: OutlinedButton.icon(
+                    onPressed: _requestAccountDeletion,
+                    icon: const Icon(Icons.delete_forever_outlined),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: const Color(0xFFDC2626),
+                    ),
+                    label: const Text('Request account deletion'),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 16),
             const Center(
               child: Text(
                 'KotaMess Owner · v1.0.0',
@@ -451,6 +511,33 @@ class _SettingsCard extends StatelessWidget {
             ...children,
           ],
         ),
+      ),
+    );
+  }
+}
+
+/// A single plain-language bullet line, styled like the other helper text in
+/// the settings cards.
+class _BulletPoint extends StatelessWidget {
+  const _BulletPoint(this.text);
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text('•  ',
+              style: TextStyle(color: Colors.black54, fontSize: 13)),
+          Expanded(
+            child: Text(
+              text,
+              style: const TextStyle(color: Colors.black54, fontSize: 13),
+            ),
+          ),
+        ],
       ),
     );
   }

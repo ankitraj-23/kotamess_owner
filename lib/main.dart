@@ -23,7 +23,9 @@ Future<void> main() async {
   if (SupabaseConfig.isConfigured) {
     await Supabase.initialize(
       url: SupabaseConfig.url,
-      anonKey: SupabaseConfig.anonKey,
+      // SUPABASE_ANON_KEY holds the publishable (anon) key; the SDK renamed the
+      // parameter from the now-deprecated `anonKey` to `publishableKey`.
+      publishableKey: SupabaseConfig.anonKey,
     );
   }
 

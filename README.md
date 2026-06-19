@@ -8,6 +8,23 @@ dashboard / daily-count / ledger screens.
 
 ---
 
+## Production readiness (quick reference)
+
+- **What it does:** turns WhatsApp chat imports into approvable daily meal
+  counts plus per-customer billing, payments and a simple ledger — all isolated
+  per owner in Supabase.
+- **Run:** `flutter pub get` then `flutter run` (see [§2–3](#2-flutter-configuration)
+  for env setup and [§3 Run](#3-run)).
+- **Deploy migrations:** `supabase db push` (see [§1b](#b-run-the-migrations)).
+- **Deploy Edge Function:** `supabase functions deploy extract-requests` and set
+  `GEMINI_API_KEY` as a Supabase secret (see [§4](#4-whatsapp-import--gemini-extraction-edge-function)).
+- **Before shipping a build, work through
+  [`PRODUCTION_CHECKLIST.md`](PRODUCTION_CHECKLIST.md)** — build commands,
+  required env vars/secrets, the RLS + owner-isolation checks, the full
+  import → billing → CSV test pass, and known limitations.
+
+---
+
 ## What's wired up
 
 - **Auth**: email/password sign up, sign in, sign out, email verification, and
