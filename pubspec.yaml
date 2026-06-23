@@ -23,6 +23,11 @@ dev_dependencies:
 
 flutter:
     uses-material-design: true
-    # No bundled assets. Local dev reads SUPABASE_* from an optional `.env`
-    # (loaded best-effort at startup, never committed); release/CI inject the
-    # same values with --dart-define. See README §2 / PRODUCTION_CHECKLIST.
+    # `.env` is declared so flutter_dotenv can load it from the bundle for local
+    # dev (it holds only the PUBLIC Supabase URL + publishable key; never
+    # committed — see .gitignore / .env.example). Release/CI builds that omit
+    # the file inject the same values with --dart-define instead; startup
+    # degrades gracefully to the "Backend not configured" screen if neither is
+    # present. See README §2 / PRODUCTION_CHECKLIST.
+    assets:
+        - .env

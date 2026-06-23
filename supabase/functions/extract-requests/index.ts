@@ -9,7 +9,7 @@
 //   3. parse WhatsApp-style messages and apply a default 90-day window
 //   4. insert the processed messages into `chat_messages`
 //   5. call Gemini server-side (rule-based fallback if unavailable)
-//   6. resolve / create the customer (`students`) for each request
+//   6. resolve the customer (`students`) for each request (never auto-created)
 //   7. insert extracted requests into `meal_requests` (status = pending)
 //   8. deterministic duplicate detection -> `request_duplicates`
 //   9. update `chat_imports` counts + final status, and return a summary
@@ -243,9 +243,10 @@ serve(async (req: Request): Promise<Response> => {
     }
 
     // --- Resolve customers (students) ----------------------------------
-    // `studentIds` holds only confident links; `ambiguousKeys` are senders that
-    // matched >1 active customer — those stay unlinked (student_id = null).
-    const { ids: studentIds, ambiguous: ambiguousKeys } = await resolveStudentIds(
+    // Per distinct sender, decide link_status (linked / needs_review /
+    // ambiguous / unreliable_sender), the linked student id (only when
+    // confident), and the candidate ids the owner can choose from in review.
+    const senderInfo = await resolveSenders(
       supabase,
       ownerId,
       requests.map((r) => r.studentName),
@@ -278,8 +279,13 @@ serve(async (req: Request): Promise<Response> => {
 
     const rows = requests.map((r, i) => {
       const sKey = nameKey(r.studentName);
-      const isAmbiguous = ambiguousKeys.has(sKey);
-      const linkedId = studentIds.get(sKey) ?? null;
+      const info = senderInfo.get(sKey) ?? {
+        status: "needs_review" as const,
+        studentId: null,
+        candidateIds: [] as string[],
+        reason: "No matching customer found — please review.",
+      };
+      const linkedId = info.studentId;
       // Confidently linked -> identity is the student_id. Unlinked / ambiguous
       // -> identity requires the exact original message (see key helpers).
       const linked = linkedId !== null;
@@ -318,7 +324,13 @@ serve(async (req: Request): Promise<Response> => {
         date_label: r.dateLabel,
         status: "pending", // confidence<0.6 / unclear / ambiguous are also pending (needs review)
         confidence: r.confidence,
-        reason: isAmbiguous ? withAmbiguityNote(r.reason) : r.reason,
+        reason: r.reason,
+        // Sender-linking metadata (0011). Drives the ambiguous-sender review flow.
+        sender_raw: r.studentName,
+        sender_normalized: sKey,
+        link_status: info.status,
+        link_reason: info.reason,
+        candidate_student_ids: info.candidateIds.length > 0 ? info.candidateIds : null,
         source,
         import_id: importId,
         message_id: messageIdByText.get(r.originalMessage) ?? null,
@@ -464,60 +476,92 @@ function pushId(map: Map<string, string[]>, key: string, id: string): void {
   }
 }
 
-// Shown in meal_requests.reason when a sender could be one of several active
-// customers. The request stays pending + unlinked so the owner picks in review.
-const STUDENT_AMBIGUOUS_NOTE =
-  "Multiple matching customers — left unlinked; choose the customer in review.";
-
-function withAmbiguityNote(reason: string): string {
-  const base = (reason ?? "").trim();
-  return base === "" ? STUDENT_AMBIGUOUS_NOTE : `${base} | ${STUDENT_AMBIGUOUS_NOTE}`;
+// One sender's resolution, keyed by nameKey in the map returned below.
+interface SenderInfo {
+  // linked: auto-linked confidently. needs_review: no confident match.
+  // ambiguous: >1 active customer shares the saved name (duplicate "Rahul").
+  // unreliable_sender: empty / "null" / symbol- or emoji-only / too little text.
+  status: "linked" | "needs_review" | "ambiguous" | "unreliable_sender";
+  studentId: string | null; // set only when status === "linked"
+  candidateIds: string[]; // customers the owner can pick from (ambiguous/review)
+  reason: string; // human-readable explanation (stored in link_reason)
 }
 
-interface StudentResolution {
-  ids: Map<string, string>; // nameKey -> confidently linked student id
-  ambiguous: Set<string>; // nameKey that matched >1 active student (left null)
+// A WhatsApp export only yields a real phone number for UNSAVED contacts; for
+// saved contacts it yields the owner's saved NAME. These senders carry no
+// usable identity and must NEVER auto-link or spawn a customer.
+function isUnreliableSender(raw: string): boolean {
+  const t = (raw ?? "").trim();
+  if (t === "") return true;
+  const low = t.toLowerCase();
+  if (["null", "undefined", "unknown", "n/a", "na", "none"].includes(low)) {
+    return true;
+  }
+  // Symbol-only / emoji-only / barely-any text: too little to identify a person.
+  const alnum = low.replace(/[^a-z0-9]/g, "");
+  return alnum.length < 2;
 }
 
-// Production-safe customer (students) resolution.
+// Production-safe sender resolution. Returns, per distinct normalized sender,
+// the link_status the request should carry plus any candidate customers.
 //
 // Priority per distinct sender:
-//   1. Exact phone match  -> link iff exactly one active student has that phone.
-//   2. Exact alias match  -> link iff the alias maps to exactly one active student.
-//   3. Unique name match  -> link iff exactly one active student shares the name.
-//   4. >1 active match at any tier -> AMBIGUOUS: student_id stays null, the
-//      sender name is preserved on the request, status stays pending. We never
-//      silently pick the first match.
-//   5. No match at all    -> create a new active student (existing safe behaviour).
-//      If a non-active student (inactive/paused) already owns the name/alias we
-//      do NOT create a duplicate; we leave it unlinked for manual review.
+//   0. Unreliable sender (empty/"null"/symbol/emoji) -> unreliable_sender; no
+//      link, no customer created.
+//   1. Phone-shaped sender:
+//        - exactly one active customer with that phone -> linked
+//        - >1 -> ambiguous (candidates)
+//        - 0  -> needs_review (NEVER create a customer named after a number)
+//   2. Saved alias -> exactly one active customer -> linked; >1 -> ambiguous.
+//   3. Unique normalized name -> exactly one active customer -> linked.
+//   4. >1 active customer share the name (the duplicate "Rahul") -> ambiguous:
+//      student_id stays null, candidates listed, owner resolves manually.
+//   5. No exact active match -> needs_review, student_id stays null. We NEVER
+//      auto-create a customer from a chat sender name (a spelling variant would
+//      silently duplicate a real student). Fuzzy lookalikes are attached as
+//      candidate suggestions only; the owner links manually in the review flow.
 //
-// Matching is scoped to ACTIVE students; the create-guard uses students of any
-// status so we never spawn a duplicate of an existing (even inactive) customer.
-//
-// Test cases (behaviour this function guarantees):
-//   1. One active "Amit"  -> "Amit: ..." links to that student.
-//   2. Two active "Amit"s -> "Amit: ..." does NOT link (student_id = null,
-//      ambiguous), no new "Amit" student is created.
-//   3. Sender phone matches exactly one active student's phone -> phone wins,
-//      even if names differ.
-//   4. Alias maps to exactly one active student -> links via alias.
-//   5. Alias OR name maps to >1 active student -> no auto-link (ambiguous).
-async function resolveStudentIds(
+// Fuzzy/partial similarity is NEVER used to auto-link and NEVER creates a
+// customer — it only powers review suggestions. We never persist a generic
+// ambiguous name like "Rahul" as an alias when multiple active customers match.
+async function resolveSenders(
   supabase: SupabaseClient,
   ownerId: string,
   names: string[],
-): Promise<StudentResolution> {
-  const ids = new Map<string, string>();
-  const ambiguous = new Set<string>();
+): Promise<Map<string, SenderInfo>> {
+  const out = new Map<string, SenderInfo>();
+  const distinct = new Map<string, string>(); // nameKey -> display name (first seen)
 
-  const distinct = new Map<string, string>(); // key -> display name (first seen)
   for (const n of names) {
+    if (isUnreliableSender(n)) {
+      const k = nameKey(n); // may be "" — all unreliable senders collapse safely
+      if (!out.has(k)) {
+        out.set(k, {
+          status: "unreliable_sender",
+          studentId: null,
+          candidateIds: [],
+          reason:
+            "Sender name is missing or unusable (WhatsApp gave no identity) — please review.",
+        });
+      }
+      continue;
+    }
     const key = nameKey(n);
-    if (key === "" || key === "unknown") continue;
+    if (key === "") {
+      // Normalized to nothing but not flagged above (e.g. honorifics only).
+      if (!out.has(key)) {
+        out.set(key, {
+          status: "unreliable_sender",
+          studentId: null,
+          candidateIds: [],
+          reason: "Sender name has no usable text — please review.",
+        });
+      }
+      continue;
+    }
     if (!distinct.has(key)) distinct.set(key, n.trim());
   }
-  if (distinct.size === 0) return { ids, ambiguous };
+  if (distinct.size === 0) return out;
 
   const { data: students } = await supabase
     .from("students")
@@ -546,62 +590,130 @@ async function resolveStudentIds(
     .from("student_aliases")
     .select("student_id, normalized_alias")
     .eq("owner_id", ownerId);
-  const activeByAlias = new Map<string, Set<string>>();
+  const activeByAlias = new Map<string, string[]>();
   const anyAlias = new Set<string>(); // any status (create-guard)
   for (const a of aliases ?? []) {
     const ak = (a.normalized_alias as string) ?? "";
     const sid = a.student_id as string;
     if (!ak || !sid) continue;
     anyAlias.add(ak);
-    if (activeIds.has(sid)) {
-      const set = activeByAlias.get(ak) ?? new Set<string>();
-      set.add(sid);
-      activeByAlias.set(ak, set);
-    }
+    if (activeIds.has(sid)) pushId(activeByAlias, ak, sid);
   }
 
-  const toCreate: Array<[string, string]> = [];
+  const ambiguousReason = (count: number, display: string) =>
+    `${count} active customers saved as “${display}” — left unlinked; choose the right one in review.`;
+
+  // Pool of active customers (by name + alias) for fuzzy suggestions only.
+  const fuzzyPool: Array<{ key: string; ids: string[] }> = [];
+  for (const [k, ids] of activeByName) fuzzyPool.push({ key: k, ids });
+  for (const [k, ids] of activeByAlias) fuzzyPool.push({ key: k, ids });
 
   for (const [key, display] of distinct.entries()) {
     // 1. Phone — only when the sender is phone-shaped.
     const pk = phoneKey(display);
     if (pk) {
       const ph = activeByPhone.get(pk);
-      if (ph && ph.length === 1) { ids.set(key, ph[0]); continue; }
-      if (ph && ph.length > 1) { ambiguous.add(key); continue; }
+      if (ph && ph.length === 1) {
+        out.set(key, { status: "linked", studentId: ph[0], candidateIds: [], reason: "Linked by phone number." });
+      } else if (ph && ph.length > 1) {
+        out.set(key, { status: "ambiguous", studentId: null, candidateIds: ph.slice(), reason: `${ph.length} active customers share this phone number — choose the right one in review.` });
+      } else {
+        // Phone number that matches nobody: never invent a customer named after
+        // a number; surface it for manual review instead.
+        out.set(key, { status: "needs_review", studentId: null, candidateIds: [], reason: "Phone number didn’t match any active customer — please review." });
+      }
+      continue;
     }
 
     // 2. Alias — exactly one active student.
     const al = activeByAlias.get(key);
-    if (al && al.size === 1) { ids.set(key, [...al][0]); continue; }
-    if (al && al.size > 1) { ambiguous.add(key); continue; }
+    if (al && al.length === 1) {
+      out.set(key, { status: "linked", studentId: al[0], candidateIds: [], reason: "Linked by a saved alias." });
+      continue;
+    }
+    if (al && al.length > 1) {
+      out.set(key, { status: "ambiguous", studentId: null, candidateIds: al.slice(), reason: ambiguousReason(al.length, display) });
+      continue;
+    }
 
     // 3. Unique normalized name — exactly one active student.
     const nm = activeByName.get(key);
-    if (nm && nm.length === 1) { ids.set(key, nm[0]); continue; }
-    if (nm && nm.length > 1) { ambiguous.add(key); continue; }
-
-    // 4. No active match. Create only when nothing (any status) owns this
-    //    name/alias, so we never duplicate an existing customer.
-    if ((anyByName.get(key)?.length ?? 0) === 0 && !anyAlias.has(key)) {
-      toCreate.push([key, display]);
-    } else {
-      ambiguous.add(key); // inactive/paused-only match -> review manually
+    if (nm && nm.length === 1) {
+      out.set(key, { status: "linked", studentId: nm[0], candidateIds: [], reason: "Linked by a unique matching customer name." });
+      continue;
     }
+    // 4. >1 active customer share the name (the duplicate "Rahul" case).
+    if (nm && nm.length > 1) {
+      out.set(key, { status: "ambiguous", studentId: null, candidateIds: nm.slice(), reason: ambiguousReason(nm.length, display) });
+      continue;
+    }
+
+    // 5. No exact active match. We NEVER auto-create a customer from a chat
+    //    sender name — spelling variations ("Ashirvad" vs "Ashirwad") would
+    //    silently spawn a duplicate of a real student. Mark needs_review and
+    //    attach FUZZY SUGGESTIONS only; the owner links manually in review.
+    const candidates = fuzzyCandidateIds(key, fuzzyPool);
+    // An inactive/paused customer with this exact name is also a strong hint.
+    for (const id of anyByName.get(key) ?? []) {
+      if (!candidates.includes(id)) candidates.push(id);
+    }
+    out.set(key, {
+      status: "needs_review",
+      studentId: null,
+      candidateIds: candidates.slice(0, 6),
+      reason: candidates.length > 0
+        ? "No exact match — showing similar customers to review."
+        : "No matching customer found — please review.",
+    });
   }
 
-  if (toCreate.length > 0) {
-    const { data: inserted, error } = await supabase
-      .from("students")
-      .insert(toCreate.map(([, name]) => ({ owner_id: ownerId, name })))
-      .select("id, name");
-    if (error) throw error;
-    for (const s of inserted ?? []) {
-      const k = nameKey((s.name as string) ?? "");
-      if (k && s.id) ids.set(k, s.id as string);
+  return out;
+}
+
+// Fuzzy suggestions for review ONLY (never used to auto-link). Suggests an
+// active customer when the normalized sender shares a meaningful name token, or
+// is within a small edit distance (catches single-letter spelling variants like
+// "Ashirvad" vs "Ashirwad"). Returns de-duplicated student ids.
+function fuzzyCandidateIds(
+  key: string,
+  pool: Array<{ key: string; ids: string[] }>,
+): string[] {
+  const keyTokens = new Set(key.split(" ").filter((t) => t !== ""));
+  const out: string[] = [];
+  for (const cand of pool) {
+    if (cand.key === key) continue; // exact match is handled before this step
+    let similar = false;
+    for (const t of cand.key.split(" ")) {
+      if (t.length >= 3 && keyTokens.has(t)) { similar = true; break; }
+    }
+    if (!similar) {
+      const d = levenshtein(key, cand.key);
+      const maxLen = Math.max(key.length, cand.key.length);
+      if (maxLen > 0 && d <= 2 && d / maxLen <= 0.34) similar = true;
+    }
+    if (similar) {
+      for (const id of cand.ids) if (!out.includes(id)) out.push(id);
     }
   }
-  return { ids, ambiguous };
+  return out;
+}
+
+// Standard iterative Levenshtein edit distance.
+function levenshtein(a: string, b: string): number {
+  if (a === b) return 0;
+  if (a.length === 0) return b.length;
+  if (b.length === 0) return a.length;
+  let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+  let curr = new Array<number>(b.length + 1);
+  for (let i = 1; i <= a.length; i++) {
+    curr[0] = i;
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      curr[j] = Math.min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost);
+    }
+    [prev, curr] = [curr, prev];
+  }
+  return prev[b.length];
 }
 
 // ---------------------------------------------------------------------------

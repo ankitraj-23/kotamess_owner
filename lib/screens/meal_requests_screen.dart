@@ -81,12 +81,12 @@ class MealRequestsScreenState extends State<MealRequestsScreen> {
 
   /// Shows a single short success/error message, replacing any current one so
   /// rapid actions don't stack a tower of SnackBars.
-  void _showSnack(String message) {
+  void _showSnack(String message, {int seconds = 1}) {
     if (!mounted) return;
     final messenger = ScaffoldMessenger.of(context);
     messenger.hideCurrentSnackBar();
     messenger.showSnackBar(
-      SnackBar(content: Text(message), duration: const Duration(seconds: 1)),
+      SnackBar(content: Text(message), duration: Duration(seconds: seconds)),
     );
   }
 
@@ -143,6 +143,14 @@ class MealRequestsScreenState extends State<MealRequestsScreen> {
   }
 
   Future<void> _approve(MealRequest r) async {
+    // Unresolved senders can't be approved — point the owner at the fix and
+    // open the linking sheet directly so resolving is one tap away.
+    if (r.isSenderUnresolved) {
+      _showSnack('Resolve the student before approving this request.',
+          seconds: 3);
+      _linkStudent(r);
+      return;
+    }
     final addsLedger =
         r.requestType == 'payment_note' || r.requestType == 'dues_query';
     await _mutateStatus(
@@ -203,10 +211,18 @@ class MealRequestsScreenState extends State<MealRequestsScreen> {
   Future<void> _approveSelected() async {
     final ids = _selected.toList();
     if (ids.isEmpty) return;
-    await _guard(
-      () => widget.databaseService.approveMany(ids),
-      'Approved ${ids.length}',
-    );
+    try {
+      final res = await widget.databaseService.approveMany(ids);
+      if (!mounted) return;
+      final msg = res.skipped == 0
+          ? 'Approved ${res.approved} linked requests.'
+          : 'Approved ${res.approved} linked requests. Skipped ${res.skipped} '
+              'unclear requests that need student review.';
+      _showSnack(msg, seconds: 3);
+      await reload(silent: true);
+    } catch (_) {
+      _showSnack('Action failed. Please try again.');
+    }
   }
 
   Future<void> _delete(MealRequest r) async {
@@ -346,6 +362,7 @@ class MealRequestsScreenState extends State<MealRequestsScreen> {
                   selectable: showSelection,
                   selected: _selected.contains(r.id),
                   busy: _busyRequestIds.contains(r.id),
+                  unresolved: r.isSenderUnresolved,
                   ledgerLinked: _ledgerLinked.contains(r.id),
                   onSelectedChanged: (v) => setState(() {
                     if (v == true) {
@@ -437,6 +454,7 @@ class _RequestCard extends StatelessWidget {
     required this.selectable,
     required this.selected,
     required this.busy,
+    required this.unresolved,
     required this.ledgerLinked,
     required this.onSelectedChanged,
     required this.onApprove,
@@ -453,6 +471,10 @@ class _RequestCard extends StatelessWidget {
   final bool selectable;
   final bool selected;
   final bool busy;
+
+  /// Sender could not be linked to a real student — approval is blocked until
+  /// the owner resolves it.
+  final bool unresolved;
   final bool ledgerLinked;
   final ValueChanged<bool?> onSelectedChanged;
   final VoidCallback? onApprove;
@@ -518,7 +540,7 @@ class _RequestCard extends StatelessWidget {
                 _Tag(request.dateDisplay),
                 _StatusTag(status: request.status),
                 if (request.isLateRequest) const _LateTag(),
-                if (request.studentId == null) const _Tag('Not linked'),
+                if (unresolved) _ResolveTag(label: request.linkStatusLabel),
                 if (ledgerLinked) const _Tag('Ledger linked'),
               ],
             ),
@@ -579,18 +601,26 @@ class _RequestCard extends StatelessWidget {
                     ),
                   const SizedBox(width: 6),
                   if (onApprove != null)
-                    FilledButton.icon(
-                      onPressed: busy ? null : onApprove,
-                      icon: busy
-                          ? const SizedBox(
-                              width: 16,
-                              height: 16,
-                              child: CircularProgressIndicator(
-                                  strokeWidth: 2, color: Colors.white),
-                            )
-                          : const Icon(Icons.check),
-                      label: const Text('Approve'),
-                    ),
+                    // Unresolved senders can't be confirmed — swap Approve for
+                    // a "Resolve first" action that opens the linking sheet.
+                    unresolved
+                        ? OutlinedButton.icon(
+                            onPressed: busy ? null : onLink,
+                            icon: const Icon(Icons.person_search, size: 18),
+                            label: const Text('Resolve first'),
+                          )
+                        : FilledButton.icon(
+                            onPressed: busy ? null : onApprove,
+                            icon: busy
+                                ? const SizedBox(
+                                    width: 16,
+                                    height: 16,
+                                    child: CircularProgressIndicator(
+                                        strokeWidth: 2, color: Colors.white),
+                                  )
+                                : const Icon(Icons.check),
+                            label: const Text('Approve'),
+                          ),
                 ],
               ),
             ],
@@ -614,6 +644,38 @@ class _Tag extends StatelessWidget {
         borderRadius: BorderRadius.circular(999),
       ),
       child: Text(text, style: const TextStyle(fontSize: 12)),
+    );
+  }
+}
+
+/// Amber "needs resolving" badge for a request whose WhatsApp sender could not
+/// be linked to a real student. Shows the link-status label (e.g. "Ambiguous
+/// name", "Unclear sender", "Not linked") with a person-search icon.
+class _ResolveTag extends StatelessWidget {
+  const _ResolveTag({required this.label});
+
+  final String label;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+      decoration: BoxDecoration(
+        color: Colors.amber.withValues(alpha: 0.16),
+        borderRadius: BorderRadius.circular(999),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(Icons.person_search, size: 12, color: Colors.amber.shade900),
+          const SizedBox(width: 4),
+          Text('Resolve student · $label',
+              style: TextStyle(
+                  fontSize: 12,
+                  color: Colors.amber.shade900,
+                  fontWeight: FontWeight.w700)),
+        ],
+      ),
     );
   }
 }
@@ -962,12 +1024,17 @@ class _LinkStudentSheetState extends State<_LinkStudentSheet> {
     }
   }
 
+  // For duplicate-name ambiguity ("two students named Rahul") we link THIS
+  // request only and never remember the generic name as a global alias.
+  String? get _aliasToSave =>
+      widget.request.isAmbiguousSender ? null : widget.request.studentName;
+
   void _linkTo(Student s) =>
       _runLink(() => widget.databaseService.linkRequestToStudent(
             requestId: widget.request.id,
             studentId: s.id,
             canonicalName: s.name,
-            aliasToSave: widget.request.studentName,
+            aliasToSave: _aliasToSave,
           ));
 
   void _createNew() => _runLink(() async {
@@ -977,7 +1044,7 @@ class _LinkStudentSheetState extends State<_LinkStudentSheet> {
           requestId: widget.request.id,
           studentId: created.id,
           canonicalName: created.name,
-          aliasToSave: widget.request.studentName,
+          aliasToSave: _aliasToSave,
         );
       });
 

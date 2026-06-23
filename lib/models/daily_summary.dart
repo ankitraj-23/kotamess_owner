@@ -122,6 +122,11 @@ class DailySummary {
         eff != null && selectedDate != null && eff == selectedDate;
 
     for (final r in approvedRequests) {
+      // Defense in depth: an unresolved/unlinked sender should never have been
+      // approved. If a legacy or stray row slips through, never let it move the
+      // cook count or appear in the breakdown lists.
+      if (r.isSenderUnresolved) continue;
+
       final type = r.requestType;
       final meal = r.mealType;
 

@@ -16,6 +16,17 @@ import '../models/student.dart';
 import 'money_utils.dart';
 import 'name_utils.dart';
 
+/// Thrown when an unresolved-sender request is asked to transition into an
+/// approved/confirmed/completed state. The message is owner-facing and safe to
+/// show directly in a SnackBar.
+class UnresolvedSenderException implements Exception {
+  const UnresolvedSenderException(
+      [this.message = 'Resolve the student before approving this request.']);
+  final String message;
+  @override
+  String toString() => message;
+}
+
 /// All Supabase reads/writes for the import → requests workflow.
 ///
 /// Every write includes `owner_id = currentOwnerId`, and every read filters by
@@ -216,13 +227,30 @@ class DatabaseService {
     );
   }
 
-  Future<int> approveMany(List<String> ids) async {
-    if (ids.isEmpty) return 0;
+  /// Bulk-approves the given requests, but only the ones whose sender is
+  /// resolved. Unresolved senders are skipped (never silently approved); the
+  /// returned record lets the UI report both counts.
+  Future<({int approved, int skipped})> approveMany(List<String> ids) async {
+    if (ids.isEmpty) return (approved: 0, skipped: 0);
     final ownerId = getCurrentOwnerId();
+    // Read the candidates first so we can partition resolved vs. unresolved and
+    // skip the unresolved ones even if the UI let them be selected.
+    final rows = await _client
+        .from('meal_requests')
+        .select()
+        .inFilter('id', ids)
+        .eq('owner_id', ownerId);
+    final candidates = rows
+        .map((e) => MealRequest.fromJson(Map<String, dynamic>.from(e)))
+        .toList();
+    final approvable = candidates.where((r) => r.isApprovable).toList();
+    final skipped = candidates.length - approvable.length;
+    if (approvable.isEmpty) return (approved: 0, skipped: skipped);
+
     final updated = await _client
         .from('meal_requests')
         .update({'status': 'approved'})
-        .inFilter('id', ids)
+        .inFilter('id', approvable.map((r) => r.id).toList())
         .eq('owner_id', ownerId)
         .select();
     // Auto-create ledger entries + audit each approved request.
@@ -236,12 +264,18 @@ class DatabaseService {
         newData: {'status': 'approved', 'student_name': req.studentName},
       );
     }
-    return updated.length;
+    return (approved: updated.length, skipped: skipped);
   }
 
-  /// Shared status transition: reads the prior status (for the audit trail),
-  /// updates, audits, and returns the refreshed request. Returns null if no
-  /// matching owner-scoped row was found.
+  /// Status transitions that confirm a request (and so may feed meal counts /
+  /// the ledger). These are gated on [MealRequest.isApprovable]; reject/cancel
+  /// stay open so the owner can always clear a bad extraction.
+  static const _confirmingStatuses = {'approved', 'completed'};
+
+  /// Shared status transition: reads the prior row (for the audit trail + the
+  /// approval guard), updates, audits, and returns the refreshed request.
+  /// Returns null if no matching owner-scoped row was found. Throws
+  /// [UnresolvedSenderException] if an unresolved sender is being confirmed.
   Future<MealRequest?> _updateRequestStatus(
     String id,
     String status,
@@ -249,12 +283,19 @@ class DatabaseService {
     Map<String, dynamic>? extra,
   }) async {
     final ownerId = getCurrentOwnerId();
-    final before = await _client
+    final beforeRow = await _client
         .from('meal_requests')
-        .select('status')
+        .select()
         .eq('id', id)
         .eq('owner_id', ownerId)
         .maybeSingle();
+    if (beforeRow == null) return null;
+    final before = MealRequest.fromJson(Map<String, dynamic>.from(beforeRow));
+    // Safety net: never let an unresolved/unlinked sender be confirmed, even if
+    // the UI somehow offered the action.
+    if (_confirmingStatuses.contains(status) && !before.isApprovable) {
+      throw const UnresolvedSenderException();
+    }
     final row = await _client
         .from('meal_requests')
         .update({'status': status, ...?extra})
@@ -268,7 +309,7 @@ class DatabaseService {
       entityType: 'meal_request',
       entityId: id,
       action: action,
-      oldData: before == null ? null : {'status': before['status']},
+      oldData: {'status': before.status},
       newData: {'status': status, 'student_name': req.studentName},
     );
     return req;
@@ -552,8 +593,15 @@ class DatabaseService {
     return list;
   }
 
-  /// Links a meal request to a canonical student and stores the request's old
-  /// extracted name as an alias, so future imports of that name auto-link.
+  /// Links a meal request to a canonical student and (optionally) stores the
+  /// request's extracted name as an alias so future imports of that spelling
+  /// auto-link. The request's link_status is set to 'linked' and its review
+  /// candidates are cleared.
+  ///
+  /// IMPORTANT: for duplicate-name ambiguity (two active "Rahul"s) the caller
+  /// MUST pass [aliasToSave] as null. Saving "Rahul" globally would wrongly
+  /// auto-link every future "Rahul" to this one student. We only persist an
+  /// alias when the extracted spelling is a safe, non-generic hint.
   Future<void> linkRequestToStudent({
     required String requestId,
     required String studentId,
@@ -563,12 +611,29 @@ class DatabaseService {
     final ownerId = getCurrentOwnerId();
     await _client
         .from('meal_requests')
-        .update({'student_id': studentId, 'student_name': canonicalName.trim()})
+        .update({
+          'student_id': studentId,
+          'student_name': canonicalName.trim(),
+          'link_status': 'linked',
+          'link_reason': 'Linked manually in sender review.',
+          'candidate_student_ids': null,
+        })
         .eq('id', requestId)
         .eq('owner_id', ownerId);
     if (aliasToSave != null && aliasToSave.trim().isNotEmpty) {
       await addAlias(studentId: studentId, alias: aliasToSave);
     }
+  }
+
+  /// The unclear/ambiguous senders from one import run that the owner still
+  /// needs to resolve: requests whose sender could not be confidently linked to
+  /// a single customer (link_status ambiguous / needs_review / unreliable_sender,
+  /// or — for older rows — simply no linked student). Newest first.
+  Future<List<MealRequest>> fetchUnclearRequestsForImport(
+    String importId,
+  ) async {
+    final all = await fetchRequestsForImport(importId);
+    return all.where((r) => r.isSenderUnresolved).toList();
   }
 
   /// Merges [sourceId] into [targetId]: moves this owner's meal requests and

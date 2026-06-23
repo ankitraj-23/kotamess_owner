@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../models/chat_import.dart';
 import '../models/chat_message.dart';
 import '../models/meal_request.dart';
+import '../models/student.dart';
 import '../services/database_service.dart';
 import '../widgets/common.dart';
 import 'import_history_screen.dart' show ImportStatusChip;
@@ -34,8 +35,13 @@ class _ImportDetailScreenState extends State<ImportDetailScreen> {
   String? _error;
   List<MealRequest> _requests = [];
   List<ChatMessage> _messages = [];
+  List<Student> _students = [];
 
   final _requestsKey = GlobalKey();
+
+  /// Requests whose WhatsApp sender could not be confidently linked.
+  List<MealRequest> get _unclear =>
+      _requests.where((r) => r.isSenderUnresolved).toList();
 
   @override
   void initState() {
@@ -52,10 +58,14 @@ class _ImportDetailScreenState extends State<ImportDetailScreen> {
       final db = widget.databaseService;
       final requests = await db.fetchRequestsForImport(widget.chatImport.id);
       final messages = await db.fetchChatMessages(widget.chatImport.id);
+      // Full customer rows (phone/room/status) so the review candidates can show
+      // the fields that help Priya tell two same-named students apart.
+      final students = await db.fetchCustomers();
       if (!mounted) return;
       setState(() {
         _requests = requests;
         _messages = messages;
+        _students = students;
         _loading = false;
       });
     } catch (_) {
@@ -76,6 +86,28 @@ class _ImportDetailScreenState extends State<ImportDetailScreen> {
       curve: Curves.easeInOut,
       alignment: 0.05,
     );
+  }
+
+  /// Opens the resolver sheet for one unclear sender. On a successful link it
+  /// refreshes so the request drops out of the review section.
+  Future<void> _resolveSender(MealRequest r) async {
+    final linked = await showModalBottomSheet<bool>(
+      context: context,
+      isScrollControlled: true,
+      builder: (_) => _ResolveSenderSheet(
+        databaseService: widget.databaseService,
+        request: r,
+        students: _students,
+      ),
+    );
+    if (linked == true && mounted) {
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(const SnackBar(
+            content: Text('Request linked.'),
+            duration: Duration(seconds: 1)));
+      await _load();
+    }
   }
 
   @override
@@ -109,6 +141,14 @@ class _ImportDetailScreenState extends State<ImportDetailScreen> {
                 child: Center(child: CircularProgressIndicator()),
               )
             else ...[
+              if (_unclear.isNotEmpty) ...[
+                _UnclearSendersSection(
+                  unclear: _unclear,
+                  students: _students,
+                  onResolve: _resolveSender,
+                ),
+                const SizedBox(height: 20),
+              ],
               _SectionHeader(
                 key: _requestsKey,
                 title: 'Extracted requests',
@@ -365,6 +405,435 @@ class _EmptyHint extends StatelessWidget {
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 12),
       child: Text(text, style: TextStyle(color: Colors.grey.shade600)),
+    );
+  }
+}
+
+/// "Review unclear students" — the ambiguous-sender review flow. Lists every
+/// request whose WhatsApp sender could not be safely linked to one customer and
+/// lets the owner resolve each one. Shown only when there is something to fix.
+class _UnclearSendersSection extends StatelessWidget {
+  const _UnclearSendersSection({
+    required this.unclear,
+    required this.students,
+    required this.onResolve,
+  });
+
+  final List<MealRequest> unclear;
+  final List<Student> students;
+  final Future<void> Function(MealRequest) onResolve;
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Icon(Icons.help_outline, color: Colors.amber.shade800, size: 20),
+            const SizedBox(width: 6),
+            Expanded(
+              child: Text('Review unclear students (${unclear.length})',
+                  style: const TextStyle(
+                      fontSize: 16, fontWeight: FontWeight.w800)),
+            ),
+          ],
+        ),
+        const SizedBox(height: 6),
+        Container(
+          width: double.infinity,
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+            color: Colors.amber.shade50,
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: Colors.amber.shade200),
+          ),
+          child: Text(
+            'WhatsApp export uses your saved contact name. If two students are '
+            'saved as the same name, Kotamess cannot safely know who sent the '
+            'message — so it leaves these unlinked for you to confirm.',
+            style: TextStyle(color: Colors.amber.shade900, fontSize: 12.5),
+          ),
+        ),
+        const SizedBox(height: 10),
+        ...unclear.map((r) => _UnclearSenderTile(
+              request: r,
+              students: students,
+              onResolve: () => onResolve(r),
+            )),
+      ],
+    );
+  }
+}
+
+class _UnclearSenderTile extends StatelessWidget {
+  const _UnclearSenderTile({
+    required this.request,
+    required this.students,
+    required this.onResolve,
+  });
+
+  final MealRequest request;
+  final List<Student> students;
+  final VoidCallback onResolve;
+
+  @override
+  Widget build(BuildContext context) {
+    final r = request;
+    final sender = (r.senderRaw?.trim().isNotEmpty ?? false)
+        ? r.senderRaw!.trim()
+        : r.studentName;
+    final candidates = students
+        .where((s) => r.candidateStudentIds.contains(s.id))
+        .toList();
+    return Card(
+      margin: const EdgeInsets.only(bottom: 10),
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Expanded(
+                  child: Text('Sent as “$sender”',
+                      style: const TextStyle(
+                          fontWeight: FontWeight.w800, fontSize: 15)),
+                ),
+                InfoPill(r.linkStatusLabel, color: _linkColor(r.linkStatus)),
+              ],
+            ),
+            const SizedBox(height: 6),
+            Wrap(
+              spacing: 6,
+              runSpacing: 6,
+              children: [
+                InfoPill(r.requestTypeLabel),
+                if (r.mealType != 'none') InfoPill(r.mealTypeLabel),
+                InfoPill(r.dateDisplay),
+              ],
+            ),
+            if (r.originalMessage.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              Text('“${r.originalMessage}”',
+                  style: TextStyle(color: Colors.grey.shade800, fontSize: 13)),
+            ],
+            if ((r.linkReason?.isNotEmpty ?? false)) ...[
+              const SizedBox(height: 6),
+              Text(r.linkReason!,
+                  style: TextStyle(color: Colors.grey.shade600, fontSize: 12)),
+            ],
+            if (candidates.isNotEmpty) ...[
+              const SizedBox(height: 6),
+              Text(
+                'Possible: ${candidates.map(_studentSummary).join(' · ')}',
+                style: TextStyle(color: Colors.grey.shade700, fontSize: 12),
+              ),
+            ],
+            if (r.isAmbiguousSender) ...[
+              const SizedBox(height: 8),
+              const _NudgeTip(),
+            ],
+            const SizedBox(height: 8),
+            Align(
+              alignment: Alignment.centerRight,
+              child: FilledButton.icon(
+                onPressed: onResolve,
+                icon: const Icon(Icons.person_search, size: 18),
+                label: const Text('Resolve'),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  static String _studentSummary(Student s) {
+    final extra = <String>[
+      if (s.roomOrAddress.trim().isNotEmpty) s.roomOrAddress.trim(),
+      if (s.phone.trim().isNotEmpty) s.phone.trim(),
+    ];
+    return extra.isEmpty ? s.name : '${s.name} (${extra.join(', ')})';
+  }
+
+  Color _linkColor(String? status) {
+    switch (status) {
+      case 'ambiguous':
+        return const Color(0xFFD97706);
+      case 'unreliable_sender':
+        return const Color(0xFF7C3AED);
+      default:
+        return const Color(0xFFEA580C);
+    }
+  }
+}
+
+/// The reliability nudge — shown only for duplicate-saved-name ambiguity.
+class _NudgeTip extends StatelessWidget {
+  const _NudgeTip();
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: Colors.blue.shade50,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: Colors.blue.shade100),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(Icons.lightbulb_outline, size: 16, color: Colors.blue.shade700),
+          const SizedBox(width: 6),
+          Expanded(
+            child: Text(
+              'Tip: rename duplicate WhatsApp contacts with a unique hint, like '
+              '“Rahul 204” or “Rahul 317”. Future exports will then be easier '
+              'to match.',
+              style: TextStyle(color: Colors.blue.shade900, fontSize: 12),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Resolver for one unclear sender: pick the right customer (or leave it). For
+/// duplicate-name ambiguity, linking fixes THIS request only and never saves
+/// the generic name as a global alias.
+class _ResolveSenderSheet extends StatefulWidget {
+  const _ResolveSenderSheet({
+    required this.databaseService,
+    required this.request,
+    required this.students,
+  });
+
+  final DatabaseService databaseService;
+  final MealRequest request;
+  final List<Student> students;
+
+  @override
+  State<_ResolveSenderSheet> createState() => _ResolveSenderSheetState();
+}
+
+class _ResolveSenderSheetState extends State<_ResolveSenderSheet> {
+  late final TextEditingController _query =
+      TextEditingController(text: widget.request.senderRaw ?? '');
+  List<StudentCandidate> _matches = [];
+  bool _loading = true;
+  bool _busy = false;
+  String? _error;
+
+  // Ambiguous (duplicate name) and unreliable senders must NOT persist the
+  // extracted name as an alias — only a genuine new spelling (needs_review) is
+  // safe to remember globally.
+  bool get _canSaveAlias => widget.request.linkStatus == 'needs_review';
+  bool get _canCreate =>
+      widget.request.linkStatus != 'ambiguous' &&
+      widget.request.linkStatus != 'unreliable_sender';
+
+  @override
+  void initState() {
+    super.initState();
+    _search();
+  }
+
+  @override
+  void dispose() {
+    _query.dispose();
+    super.dispose();
+  }
+
+  Future<void> _search() async {
+    setState(() => _loading = true);
+    try {
+      final matches =
+          await widget.databaseService.findStudentMatches(_query.text);
+      if (!mounted) return;
+      setState(() {
+        _matches = matches;
+        _loading = false;
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+        _error = 'Could not search students.';
+      });
+    }
+  }
+
+  Future<void> _run(Future<void> Function() action) async {
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      await action();
+      if (mounted) Navigator.pop(context, true);
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _busy = false;
+        _error = 'Could not link this request. Please try again.';
+      });
+    }
+  }
+
+  void _linkTo(Student s) => _run(() => widget.databaseService
+          .linkRequestToStudent(
+        requestId: widget.request.id,
+        studentId: s.id,
+        canonicalName: s.name,
+        aliasToSave: _canSaveAlias ? widget.request.senderRaw : null,
+      ));
+
+  void _createNew() => _run(() async {
+        final created =
+            await widget.databaseService.createStudent(_query.text.trim());
+        await widget.databaseService.linkRequestToStudent(
+          requestId: widget.request.id,
+          studentId: created.id,
+          canonicalName: created.name,
+          aliasToSave: _canSaveAlias ? widget.request.senderRaw : null,
+        );
+      });
+
+  @override
+  Widget build(BuildContext context) {
+    final r = widget.request;
+    final candidates = widget.students
+        .where((s) => r.candidateStudentIds.contains(s.id))
+        .toList();
+    final sender = (r.senderRaw?.trim().isNotEmpty ?? false)
+        ? r.senderRaw!.trim()
+        : r.studentName;
+    return Padding(
+      padding: EdgeInsets.only(
+        left: 16,
+        right: 16,
+        top: 16,
+        bottom: MediaQuery.of(context).viewInsets.bottom + 16,
+      ),
+      child: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text('Resolve unclear student',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800)),
+            const SizedBox(height: 4),
+            Text('WhatsApp sent this as “$sender”.',
+                style: TextStyle(color: Colors.grey.shade700, fontSize: 13)),
+            if ((r.linkReason?.isNotEmpty ?? false)) ...[
+              const SizedBox(height: 4),
+              Text(r.linkReason!,
+                  style: TextStyle(color: Colors.grey.shade600, fontSize: 12)),
+            ],
+            if (r.isAmbiguousSender) ...[
+              const SizedBox(height: 10),
+              const _NudgeTip(),
+            ],
+            if (candidates.isNotEmpty) ...[
+              const SizedBox(height: 14),
+              Text('Likely matches',
+                  style: TextStyle(
+                      color: Colors.grey.shade700,
+                      fontSize: 12,
+                      fontWeight: FontWeight.w700)),
+              ...candidates.map((s) => _studentRow(
+                    s,
+                    subtitle: _subtitle(s),
+                  )),
+            ],
+            const SizedBox(height: 14),
+            TextField(
+              controller: _query,
+              textCapitalization: TextCapitalization.words,
+              textInputAction: TextInputAction.search,
+              onChanged: (_) => setState(() {}),
+              onSubmitted: (_) => _search(),
+              decoration: InputDecoration(
+                labelText: 'Search all students',
+                prefixIcon: const Icon(Icons.search),
+                suffixIcon: IconButton(
+                  icon: const Icon(Icons.refresh),
+                  tooltip: 'Search',
+                  onPressed: _busy ? null : _search,
+                ),
+              ),
+            ),
+            const SizedBox(height: 12),
+            if (_loading)
+              const Padding(
+                padding: EdgeInsets.symmetric(vertical: 16),
+                child: Center(child: CircularProgressIndicator()),
+              )
+            else if (_matches.isEmpty)
+              Text('No matching students yet.',
+                  style: TextStyle(color: Colors.grey.shade600))
+            else
+              ..._matches.map((c) => _studentRow(
+                    c.student,
+                    subtitle: c.reasonLabel,
+                  )),
+            if (_error != null) ...[
+              const SizedBox(height: 8),
+              Text(_error!, style: const TextStyle(color: Color(0xFFDC2626))),
+            ],
+            const Divider(height: 24),
+            if (_canCreate)
+              SizedBox(
+                width: double.infinity,
+                child: OutlinedButton.icon(
+                  onPressed: (_busy || _query.text.trim().isEmpty)
+                      ? null
+                      : _createNew,
+                  icon: const Icon(Icons.person_add_alt),
+                  label: Text(_query.text.trim().isEmpty
+                      ? 'Enter a name to create a student'
+                      : 'Create new student “${_query.text.trim()}”'),
+                ),
+              ),
+            const SizedBox(height: 8),
+            SizedBox(
+              width: double.infinity,
+              child: TextButton(
+                onPressed: _busy ? null : () => Navigator.pop(context, false),
+                child: const Text('Leave unlinked / Not sure'),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  String _subtitle(Student s) {
+    final parts = <String>[
+      if (s.roomOrAddress.trim().isNotEmpty) s.roomOrAddress.trim(),
+      if (s.phone.trim().isNotEmpty) s.phone.trim(),
+      Student.statusLabel(s.status),
+    ];
+    return parts.join(' · ');
+  }
+
+  Widget _studentRow(Student s, {required String subtitle}) {
+    return ListTile(
+      contentPadding: EdgeInsets.zero,
+      leading: CircleAvatar(
+        child: Text(s.name.isEmpty ? '?' : s.name[0].toUpperCase()),
+      ),
+      title: Text(s.name,
+          style: const TextStyle(fontWeight: FontWeight.w700)),
+      subtitle: subtitle.isEmpty ? null : Text(subtitle),
+      trailing: TextButton(
+        onPressed: _busy ? null : () => _linkTo(s),
+        child: const Text('Link'),
+      ),
     );
   }
 }

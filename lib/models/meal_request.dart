@@ -37,6 +37,17 @@ class MealRequest {
   final DateTime? messageReceivedAt;
   final String? lateReason;
 
+  /// Sender-linking metadata set by the extract-requests Edge Function (0011).
+  /// [senderRaw] is the WhatsApp sender exactly as exported; [linkStatus] is one
+  /// of 'linked' | 'needs_review' | 'ambiguous' | 'unreliable_sender' (null for
+  /// rows imported before this feature). [candidateStudentIds] are the customer
+  /// ids the owner can choose from when the sender is ambiguous / needs review.
+  final String? senderRaw;
+  final String? senderNormalized;
+  final String? linkStatus;
+  final String? linkReason;
+  final List<String> candidateStudentIds;
+
   MealRequest({
     required this.id,
     required this.ownerId,
@@ -60,6 +71,11 @@ class MealRequest {
     this.cutoffAt,
     this.messageReceivedAt,
     this.lateReason,
+    this.senderRaw,
+    this.senderNormalized,
+    this.linkStatus,
+    this.linkReason,
+    this.candidateStudentIds = const [],
   });
 
   factory MealRequest.fromJson(Map<String, dynamic> json) {
@@ -87,6 +103,14 @@ class MealRequest {
       messageReceivedAt:
           DateTime.tryParse(json['message_received_at'] as String? ?? ''),
       lateReason: json['late_reason'] as String?,
+      senderRaw: json['sender_raw'] as String?,
+      senderNormalized: json['sender_normalized'] as String?,
+      linkStatus: json['link_status'] as String?,
+      linkReason: json['link_reason'] as String?,
+      candidateStudentIds: (json['candidate_student_ids'] as List?)
+              ?.map((e) => e.toString())
+              .toList() ??
+          const [],
     );
   }
 
@@ -106,6 +130,44 @@ class MealRequest {
   String get requestTypeLabel => MealRequestVocab.typeLabel(requestType);
   String get mealTypeLabel => MealRequestVocab.mealLabel(mealType);
   String get statusLabel => MealRequestVocab.statusLabel(status);
+
+  /// The single source of truth for "may this request be approved/confirmed?".
+  /// A request is approvable only when it resolves to a real customer:
+  ///   * [studentId] is set, AND
+  ///   * [linkStatus] is 'linked' — or null/empty for legacy rows imported
+  ///     before the 0011 sender metadata (those already carry a student_id).
+  /// Ambiguous / needs_review / unreliable_sender rows (and any row with no
+  /// linked student) are NOT approvable until the owner links them.
+  bool get isApprovable {
+    if (studentId == null) return false;
+    final ls = linkStatus;
+    if (ls == null || ls.isEmpty) return true; // legacy row, already linked
+    return ls == 'linked';
+  }
+
+  /// True when the WhatsApp sender could NOT be confidently linked to a single
+  /// customer, so the owner must resolve it in the review flow before the
+  /// request can be approved or counted. The exact inverse of [isApprovable].
+  bool get isSenderUnresolved => !isApprovable;
+
+  /// True only for the duplicate-saved-name case ("two students named Rahul").
+  /// Drives the nudge that asks Priya to rename duplicate WhatsApp contacts.
+  bool get isAmbiguousSender => linkStatus == 'ambiguous';
+
+  String get linkStatusLabel {
+    switch (linkStatus) {
+      case 'linked':
+        return 'Linked';
+      case 'ambiguous':
+        return 'Ambiguous name';
+      case 'unreliable_sender':
+        return 'Unclear sender';
+      case 'needs_review':
+        return 'Needs review';
+      default:
+        return studentId == null ? 'Not linked' : 'Linked';
+    }
+  }
 
   bool get isDuplicateFlagged => duplicateStatus != 'unique';
   String get duplicateStatusLabel {
