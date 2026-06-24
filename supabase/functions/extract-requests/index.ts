@@ -30,6 +30,7 @@
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient, SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { isGroupSystemLine, parseRosterEvents } from "./roster_parser.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -75,6 +76,12 @@ interface ImportSummary {
   extractedCount: number;
   duplicateCount: number;
   rejectedCount: number;
+  // Roster onboarding from group join/add system messages (e.g.
+  // "Rahul Room 204 joined using a group link."). Independent of meal requests.
+  rosterFound: number; // distinct join/add names seen in this import
+  rosterCreated: number; // new customers created from join events
+  rosterMatched: number; // join names that already mapped to one customer
+  rosterAmbiguous: number; // join names that matched >1 customer (left for review)
 }
 
 function json(body: unknown, status = 200): Response {
@@ -92,6 +99,10 @@ function emptySummary(): ImportSummary {
     extractedCount: 0,
     duplicateCount: 0,
     rejectedCount: 0,
+    rosterFound: 0,
+    rosterCreated: 0,
+    rosterMatched: 0,
+    rosterAmbiguous: 0,
   };
 }
 
@@ -169,6 +180,14 @@ serve(async (req: Request): Promise<Response> => {
 
   const warnings: string[] = [];
   try {
+    // --- Roster onboarding from group join/add system messages ----------
+    // Parsed from the WHOLE export (not the 90-day window) since onboarding a
+    // student is not time-sensitive. Runs BEFORE meal-request resolution so a
+    // "Rahul Room 204: No dinner today" later in the same import links to the
+    // customer this step just created. Never inserts meal_requests.
+    const rosterEvents = parseRosterEvents(chatText);
+    const roster = await onboardRoster(supabase, ownerId, rosterEvents, importId);
+
     // --- Parse + 90-day window -----------------------------------------
     const parsed = parseWhatsApp(chatText);
     const cutoffMs = Date.parse(today + "T00:00:00Z") - RETENTION_DAYS * 86_400_000;
@@ -396,6 +415,10 @@ serve(async (req: Request): Promise<Response> => {
       extractedCount: insertedIds.length,
       duplicateCount,
       rejectedCount,
+      rosterFound: roster.found,
+      rosterCreated: roster.created,
+      rosterMatched: roster.matched,
+      rosterAmbiguous: roster.ambiguous,
     };
 
     await supabase
@@ -717,6 +740,149 @@ function levenshtein(a: string, b: string): number {
 }
 
 // ---------------------------------------------------------------------------
+// Roster onboarding: creating/matching customers from join/add events
+// ---------------------------------------------------------------------------
+interface RosterResult {
+  found: number; // distinct usable join/add names
+  created: number; // new customers created
+  matched: number; // names that mapped to exactly one existing customer
+  ambiguous: number; // names that matched >1 customer (left for review)
+}
+
+// Create or match a customer for each parsed join/add name, using the SAME
+// conservative matching the meal-request resolver uses (unique phone, unique
+// alias, unique name). The new member's WhatsApp display name is preserved
+// verbatim as the customer name and stored as a normalized alias so future meal
+// requests link exactly. Duplicate protection:
+//   * Same normalized name seen twice in one import -> handled once.
+//   * Name already mapping to exactly one customer -> matched, never duplicated.
+//   * Name mapping to >1 active customer -> ambiguous: NEVER merged/created,
+//     left for the owner to resolve.
+//   * Phone-shaped join name (an unsaved contact) is matched by phone only and
+//     never spawns a customer named after a number.
+// No fake phone numbers or plan amounts are ever written; new customers are
+// active with monthly_plan defaulting to 0 (needs plan setup later).
+async function onboardRoster(
+  supabase: SupabaseClient,
+  ownerId: string,
+  rawNames: string[],
+  _importId: string | null, // reserved; students has no last_seen/import_id column
+): Promise<RosterResult> {
+  const result: RosterResult = { found: 0, created: 0, matched: 0, ambiguous: 0 };
+
+  // Dedupe within this import by normalized key; keep the first-seen display.
+  const distinct = new Map<string, string>(); // nameKey -> display name
+  for (const n of rawNames) {
+    if (isUnreliableSender(n)) continue;
+    const key = nameKey(n);
+    if (key === "") continue;
+    if (!distinct.has(key)) distinct.set(key, n.trim());
+  }
+  if (distinct.size === 0) return result;
+  result.found = distinct.size;
+
+  // Snapshot existing customers + aliases (mirrors resolveSenders).
+  const { data: students } = await supabase
+    .from("students")
+    .select("id, name, phone, status, active")
+    .eq("owner_id", ownerId);
+
+  const activeByName = new Map<string, string[]>();
+  const activeByPhone = new Map<string, string[]>();
+  const activeIds = new Set<string>();
+  for (const s of students ?? []) {
+    const id = s.id as string;
+    if (!id || !isActiveStudent(s)) continue;
+    activeIds.add(id);
+    const nk = nameKey((s.name as string) ?? "");
+    if (nk) pushId(activeByName, nk, id);
+    const pk = phoneKey((s.phone as string) ?? "");
+    if (pk) pushId(activeByPhone, pk, id);
+  }
+
+  const { data: aliases } = await supabase
+    .from("student_aliases")
+    .select("student_id, normalized_alias")
+    .eq("owner_id", ownerId);
+  const activeByAlias = new Map<string, string[]>();
+  const existingAliasKeys = new Set<string>(); // any-status, for the create-guard
+  for (const a of aliases ?? []) {
+    const ak = (a.normalized_alias as string) ?? "";
+    const sid = a.student_id as string;
+    if (!ak || !sid) continue;
+    existingAliasKeys.add(ak);
+    if (activeIds.has(sid)) pushId(activeByAlias, ak, sid);
+  }
+
+  // Best-effort alias upsert: never fail the whole import over an alias write,
+  // and never repoint an alias that already maps somewhere (unique index).
+  const ensureAlias = async (studentId: string, display: string, key: string) => {
+    if (existingAliasKeys.has(key)) return;
+    try {
+      await supabase.from("student_aliases").insert({
+        owner_id: ownerId,
+        student_id: studentId,
+        alias: display,
+        normalized_alias: key,
+      });
+      existingAliasKeys.add(key);
+    } catch (_e) {
+      // ignore — exact future matching still works via the unique name.
+    }
+  };
+
+  for (const [key, display] of distinct.entries()) {
+    // Phone-shaped join name (unsaved contact): match by phone only; never
+    // create a customer named after a number.
+    const pk = phoneKey(display);
+    if (pk) {
+      const ph = activeByPhone.get(pk) ?? [];
+      if (ph.length === 1) result.matched++;
+      else result.ambiguous++; // 0 or >1 -> needs owner review, no creation
+      continue;
+    }
+
+    // 1. Unique saved alias.
+    const al = activeByAlias.get(key) ?? [];
+    if (al.length === 1) { result.matched++; continue; }
+    if (al.length > 1) { result.ambiguous++; continue; }
+
+    // 2. Unique active name.
+    const nm = activeByName.get(key) ?? [];
+    if (nm.length === 1) {
+      // Store the verbatim WhatsApp name as an alias for exact future matching.
+      await ensureAlias(nm[0], display, key);
+      result.matched++;
+      continue;
+    }
+    if (nm.length > 1) { result.ambiguous++; continue; }
+
+    // 3. No match -> create a new active customer with the WhatsApp name.
+    try {
+      const { data: created, error: insErr } = await supabase
+        .from("students")
+        .insert({ owner_id: ownerId, name: display, status: "active" })
+        .select("id")
+        .single();
+      if (insErr || !created) throw insErr ?? new Error("insert failed");
+      const newId = created.id as string;
+      // Reflect into the in-memory snapshot so a later same-name event in THIS
+      // import matches it instead of creating a duplicate.
+      pushId(activeByName, key, newId);
+      activeIds.add(newId);
+      await ensureAlias(newId, display, key);
+      result.created++;
+    } catch (_e) {
+      // Could not create (e.g. transient) — surface as ambiguous/needs review
+      // rather than silently dropping the roster name.
+      result.ambiguous++;
+    }
+  }
+
+  return result;
+}
+
+// ---------------------------------------------------------------------------
 // Duplicate detection
 // ---------------------------------------------------------------------------
 // Duplicate identity keys. `sid|`- and `msg|`-prefixed keys share one map but
@@ -948,6 +1114,13 @@ function parseWhatsApp(raw: string): ChatMessage[] {
     if (parsed) {
       push();
       current = parsed;
+    } else if (isGroupSystemLine(line)) {
+      // Join/add events and group notices (encryption notice, "You created
+      // this group", invite-link line, etc.) are NOT chat messages. Skip them
+      // entirely so they never merge into a meal request's text. Roster join
+      // events are handled separately by parseRosterEvents.
+      push();
+      current = null;
     } else if (current) {
       current.text += " " + line;
     } else {

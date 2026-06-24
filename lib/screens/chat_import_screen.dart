@@ -266,6 +266,22 @@ class _SummaryCard extends StatelessWidget {
             _SummaryRow('Possible duplicates', summary.duplicateCount),
             _SummaryRow('Needs review (low confidence / unclear)',
                 summary.rejectedCount),
+            if (summary.hasRoster) ...[
+              const Divider(height: 20),
+              Text(
+                'Roster (group join events)',
+                style: Theme.of(context)
+                    .textTheme
+                    .titleSmall
+                    ?.copyWith(fontWeight: FontWeight.w800),
+              ),
+              const SizedBox(height: 6),
+              _SummaryRow('Join names found', summary.rosterFound),
+              _SummaryRow('New students created', summary.rosterCreated,
+                  emphasize: true),
+              _SummaryRow('Existing students matched', summary.rosterMatched),
+              _SummaryRow('Ambiguous / skipped', summary.rosterAmbiguous),
+            ],
           ],
         ),
       ),

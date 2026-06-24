@@ -86,6 +86,11 @@ class ImportSummary {
   final int extractedCount;
   final int duplicateCount;
   final int rejectedCount; // low-confidence / unclear — saved as pending to review
+  // Roster onboarding from WhatsApp group join/add system messages.
+  final int rosterFound; // distinct join/add names seen in this import
+  final int rosterCreated; // new customers created from join events
+  final int rosterMatched; // join names that already mapped to one customer
+  final int rosterAmbiguous; // join names that matched >1 customer (left for review)
   final List<String> warnings;
   final String? error;
 
@@ -98,11 +103,18 @@ class ImportSummary {
     required this.extractedCount,
     required this.duplicateCount,
     required this.rejectedCount,
+    required this.rosterFound,
+    required this.rosterCreated,
+    required this.rosterMatched,
+    required this.rosterAmbiguous,
     required this.warnings,
     required this.error,
   });
 
   bool get ok => status != 'failed';
+
+  /// True when this import contained any group join/add events to report.
+  bool get hasRoster => rosterFound > 0;
 
   bool get usedFallback =>
       warnings.any((w) => w.toLowerCase().contains('fallback'));
@@ -119,6 +131,10 @@ class ImportSummary {
       extractedCount: count('extractedCount'),
       duplicateCount: count('duplicateCount'),
       rejectedCount: count('rejectedCount'),
+      rosterFound: count('rosterFound'),
+      rosterCreated: count('rosterCreated'),
+      rosterMatched: count('rosterMatched'),
+      rosterAmbiguous: count('rosterAmbiguous'),
       warnings: (json['warnings'] as List<dynamic>? ?? const [])
           .map((w) => w.toString())
           .toList(),
