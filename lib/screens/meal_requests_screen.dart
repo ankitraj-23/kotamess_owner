@@ -161,6 +161,66 @@ class MealRequestsScreenState extends State<MealRequestsScreen> {
     );
   }
 
+  /// Decides what the unresolved-request primary button should do, keeping the
+  /// production-safe rules intact:
+  ///   * ambiguous (duplicate saved name) / unreliable sender → owner MUST pick
+  ///     the right existing customer first; never auto-create.
+  ///   * needs_review / unlinked WITH candidates → open the resolve sheet.
+  ///   * needs_review / unlinked WITHOUT candidates and a usable name → one-tap
+  ///     "Create customer & approve".
+  ///   * otherwise (no safe name) → manual resolve.
+  ({String label, VoidCallback onPressed}) _resolveMode(MealRequest r) {
+    if (r.isAmbiguousSender || r.isUnreliableSender) {
+      return (label: 'Resolve first', onPressed: () => _linkStudent(r));
+    }
+    if (r.hasResolveCandidates) {
+      return (label: 'Resolve', onPressed: () => _linkStudent(r));
+    }
+    if (r.canCreateCustomerFromName) {
+      return (
+        label: 'Create customer & approve',
+        onPressed: () => _createCustomerAndApprove(r),
+      );
+    }
+    return (label: 'Resolve first', onPressed: () => _linkStudent(r));
+  }
+
+  /// One-tap path for a safe `needs_review` request with no candidates: create
+  /// a new active customer from the extracted name, link this request to it
+  /// (saving the name as an alias), then approve. Guarded so an unreliable /
+  /// empty / "Unknown" name can never silently create a customer.
+  Future<void> _createCustomerAndApprove(MealRequest r) async {
+    if (!r.canCreateCustomerFromName) {
+      _showSnack('Resolve the student before approving this request.',
+          seconds: 3);
+      _linkStudent(r);
+      return;
+    }
+    final name = r.studentName.trim();
+    final addsLedger =
+        r.requestType == 'payment_note' || r.requestType == 'dues_query';
+    await _mutateStatus(
+      r,
+      'approved',
+      () async {
+        final created =
+            await widget.databaseService.createCustomer(name: name);
+        await widget.databaseService.linkRequestToStudent(
+          requestId: r.id,
+          studentId: created.id,
+          canonicalName: created.name,
+          aliasToSave: name,
+        );
+        // Keep the local model in step so the safety guard in approve sees a
+        // linked request.
+        r.studentId = created.id;
+        await widget.databaseService.approveMealRequest(r.id);
+      },
+      addsLedger ? 'Customer created · Approved · added to Ledger'
+          : 'Customer created · Approved',
+    );
+  }
+
   /// Opens the link/alias sheet so the owner can attach this request to an
   /// existing student (saving the extracted name as an alias) or create one.
   Future<void> _linkStudent(MealRequest r) async {
@@ -357,12 +417,20 @@ class MealRequestsScreenState extends State<MealRequestsScreen> {
           else if (_items.isEmpty)
             const _EmptyRequests()
           else
-            ..._items.map((r) => _RequestCard(
+            ..._items.map((r) {
+              final unresolved = r.isSenderUnresolved;
+              // For a pending unresolved request, pick the owner-friendly
+              // primary action (Approve is replaced by Resolve / Create).
+              final resolve =
+                  (unresolved && r.status == 'pending') ? _resolveMode(r) : null;
+              return _RequestCard(
                   request: r,
                   selectable: showSelection,
                   selected: _selected.contains(r.id),
                   busy: _busyRequestIds.contains(r.id),
-                  unresolved: r.isSenderUnresolved,
+                  unresolved: unresolved,
+                  resolveLabel: resolve?.label,
+                  onResolve: resolve?.onPressed,
                   ledgerLinked: _ledgerLinked.contains(r.id),
                   onSelectedChanged: (v) => setState(() {
                     if (v == true) {
@@ -371,7 +439,9 @@ class MealRequestsScreenState extends State<MealRequestsScreen> {
                       _selected.remove(r.id);
                     }
                   }),
-                  onApprove: r.status == 'pending' ? () => _approve(r) : null,
+                  onApprove: (r.status == 'pending' && !unresolved)
+                      ? () => _approve(r)
+                      : null,
                   onReject: r.status == 'pending' ? () => _reject(r) : null,
                   onEdit: () => _edit(r),
                   onLink: () => _linkStudent(r),
@@ -382,7 +452,8 @@ class MealRequestsScreenState extends State<MealRequestsScreen> {
                       ? () => _cancel(r)
                       : null,
                   onAddNote: () => _addNote(r),
-                )),
+                );
+            }),
         ],
       ),
     );
@@ -455,6 +526,8 @@ class _RequestCard extends StatelessWidget {
     required this.selected,
     required this.busy,
     required this.unresolved,
+    required this.resolveLabel,
+    required this.onResolve,
     required this.ledgerLinked,
     required this.onSelectedChanged,
     required this.onApprove,
@@ -475,6 +548,12 @@ class _RequestCard extends StatelessWidget {
   /// Sender could not be linked to a real student — approval is blocked until
   /// the owner resolves it.
   final bool unresolved;
+
+  /// Owner-friendly label for the primary action of an unresolved pending
+  /// request ("Resolve first" / "Resolve" / "Create customer & approve").
+  /// Null when the request is resolved (a plain Approve is shown instead).
+  final String? resolveLabel;
+  final VoidCallback? onResolve;
   final bool ledgerLinked;
   final ValueChanged<bool?> onSelectedChanged;
   final VoidCallback? onApprove;
@@ -588,7 +667,7 @@ class _RequestCard extends StatelessWidget {
                 ],
               ),
             ],
-            if (onApprove != null || onReject != null) ...[
+            if (onApprove != null || onReject != null || onResolve != null) ...[
               const SizedBox(height: 8),
               Row(
                 mainAxisAlignment: MainAxisAlignment.end,
@@ -600,27 +679,33 @@ class _RequestCard extends StatelessWidget {
                       label: const Text('Reject'),
                     ),
                   const SizedBox(width: 6),
-                  if (onApprove != null)
-                    // Unresolved senders can't be confirmed — swap Approve for
-                    // a "Resolve first" action that opens the linking sheet.
-                    unresolved
-                        ? OutlinedButton.icon(
-                            onPressed: busy ? null : onLink,
-                            icon: const Icon(Icons.person_search, size: 18),
-                            label: const Text('Resolve first'),
-                          )
-                        : FilledButton.icon(
-                            onPressed: busy ? null : onApprove,
-                            icon: busy
-                                ? const SizedBox(
-                                    width: 16,
-                                    height: 16,
-                                    child: CircularProgressIndicator(
-                                        strokeWidth: 2, color: Colors.white),
-                                  )
-                                : const Icon(Icons.check),
-                            label: const Text('Approve'),
-                          ),
+                  // Unresolved senders can't be confirmed directly — show the
+                  // owner-friendly resolve/create action chosen by the parent.
+                  if (onResolve != null)
+                    OutlinedButton.icon(
+                      onPressed: busy ? null : onResolve,
+                      icon: busy
+                          ? const SizedBox(
+                              width: 16,
+                              height: 16,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : const Icon(Icons.person_search, size: 18),
+                      label: Text(resolveLabel ?? 'Resolve first'),
+                    )
+                  else if (onApprove != null)
+                    FilledButton.icon(
+                      onPressed: busy ? null : onApprove,
+                      icon: busy
+                          ? const SizedBox(
+                              width: 16,
+                              height: 16,
+                              child: CircularProgressIndicator(
+                                  strokeWidth: 2, color: Colors.white),
+                            )
+                          : const Icon(Icons.check),
+                      label: const Text('Approve'),
+                    ),
                 ],
               ),
             ],

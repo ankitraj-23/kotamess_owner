@@ -154,6 +154,26 @@ class MealRequest {
   /// Drives the nudge that asks Priya to rename duplicate WhatsApp contacts.
   bool get isAmbiguousSender => linkStatus == 'ambiguous';
 
+  /// True when the WhatsApp sender itself is unreliable (e.g. a bare phone
+  /// number or a group/system event) — we must never auto-create a customer
+  /// from it; the owner has to link/resolve it manually.
+  bool get isUnreliableSender => linkStatus == 'unreliable_sender';
+
+  /// True when there are existing customers the owner can pick from to resolve
+  /// this request (set by the import sender-linking pass).
+  bool get hasResolveCandidates => candidateStudentIds.isNotEmpty;
+
+  /// Whether it is safe to one-tap "Create customer & approve" from this
+  /// request. Only for the plain needs_review / unlinked case with a usable
+  /// name — never for ambiguous duplicates or unreliable senders, and never
+  /// for an empty / "Unknown" name.
+  bool get canCreateCustomerFromName {
+    if (isAmbiguousSender || isUnreliableSender) return false;
+    final n = studentName.trim();
+    if (n.isEmpty) return false;
+    return n.toLowerCase() != 'unknown';
+  }
+
   String get linkStatusLabel {
     switch (linkStatus) {
       case 'linked':

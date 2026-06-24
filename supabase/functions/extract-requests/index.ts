@@ -19,7 +19,7 @@
 // server secret and never leaves the server / is never returned to the client.
 //
 // Vocabulary note: the section-6 enum names in the task brief (meal_cancel,
-// full_day, breakfast, …) are NOT used — the live DB CHECK constraints enforce
+// full_day, …) are NOT used — the live DB CHECK constraints enforce
 // the existing app vocabulary (cancel_meal/add_meal/…, lunch/dinner/both/none,
 // status pending/approved/rejected/completed/cancelled). We keep the existing
 // vocabulary so inserts pass and the Requests review flow keeps working.
@@ -57,6 +57,20 @@ const LOW_CONFIDENCE = 0.6;
 // Fallback request cutoff when owner_profiles has no usable value (matches the
 // migration default). Read the column first; never hardcode "60 minutes".
 const DEFAULT_CUTOFF_MINUTES = 60;
+
+// Long-import safety. Candidate (likely-actionable) messages are sent to Gemini
+// in batches so one big export never becomes one giant, slow request, and a
+// per-batch timeout keeps the whole import from hanging indefinitely. If a
+// single batch fails (or times out), only that batch falls back to the
+// rule-based parser — the rest of the import still uses Gemini.
+const GEMINI_BATCH_SIZE = 50;
+const GEMINI_TIMEOUT_MS = 40_000;
+
+// Lightweight phase timing for the Edge Function logs. Logs COUNTS and DURATIONS
+// only — never raw chat text, never student names, never the Gemini key.
+function logTiming(phase: string, ms: number, extra: Record<string, unknown> = {}): void {
+  console.log("[extract-requests] timing", JSON.stringify({ phase, ms, ...extra }));
+}
 
 interface ExtractedRequest {
   studentName: string;
@@ -179,17 +193,29 @@ serve(async (req: Request): Promise<Response> => {
   }
 
   const warnings: string[] = [];
+  const t0 = Date.now();
   try {
     // --- Roster onboarding from group join/add system messages ----------
     // Parsed from the WHOLE export (not the 90-day window) since onboarding a
     // student is not time-sensitive. Runs BEFORE meal-request resolution so a
     // "Rahul Room 204: No dinner today" later in the same import links to the
-    // customer this step just created. Never inserts meal_requests.
+    // customer this step just created/matched. Priya creates a dedicated group
+    // for CURRENT active mess students, so everyone who joins/was added is an
+    // active customer — onboardRoster bulk-creates them (see onboardRoster).
+    const tRoster = Date.now();
     const rosterEvents = parseRosterEvents(chatText);
-    const roster = await onboardRoster(supabase, ownerId, rosterEvents, importId);
+    const roster = await onboardRoster(supabase, ownerId, rosterEvents, warnings);
+    logTiming("roster", Date.now() - tRoster, {
+      found: roster.found,
+      matched: roster.matched,
+      created: roster.created,
+      ambiguous: roster.ambiguous,
+    });
 
     // --- Parse + 90-day window -----------------------------------------
+    const tParse = Date.now();
     const parsed = parseWhatsApp(chatText);
+    logTiming("parse_whatsapp", Date.now() - tParse, { count: parsed.length });
     const cutoffMs = Date.parse(today + "T00:00:00Z") - RETENTION_DAYS * 86_400_000;
 
     const processed: ChatMessage[] = [];
@@ -213,6 +239,7 @@ serve(async (req: Request): Promise<Response> => {
     // check below. First occurrence wins (mirrors messageIdByText).
     const messageTsByText = new Map<string, Date>();
     if (processed.length > 0) {
+      const tMsg = Date.now();
       const rows = processed.map((m) => {
         const ts = parseTimestamp(m.dateText);
         if (ts && !messageTsByText.has(m.text)) messageTsByText.set(m.text, ts);
@@ -236,30 +263,24 @@ serve(async (req: Request): Promise<Response> => {
         const text = r.message_text as string;
         if (!messageIdByText.has(text)) messageIdByText.set(text, r.id as string);
       }
+      logTiming("chat_messages_insert", Date.now() - tMsg, { count: rows.length });
     }
 
-    // --- Extract (Gemini, fallback to rule-based) ----------------------
-    // Only the in-window messages are sent for extraction.
-    const filteredText = processed
-      .map((m) => (m.dateText ? `${m.dateText} - ` : "") + `${m.sender}: ${m.text}`)
-      .join("\n");
-
+    // --- Extract (Gemini on candidate messages, batched) ----------------
+    // Instead of sending the whole in-window export to Gemini, we first reduce
+    // it to the likely-actionable CANDIDATE messages (meal/cancel/payment/…),
+    // then send those in batches with a per-batch timeout. This keeps long
+    // imports fast and bounded, and lets a single failing batch fall back to
+    // the rule-based parser without sinking the whole import.
     const geminiKey = Deno.env.get("GEMINI_API_KEY");
     const geminiModel = Deno.env.get("GEMINI_MODEL") ?? "gemini-2.5-flash";
-    let requests: ExtractedRequest[] | null = null;
-    if (geminiKey && filteredText.trim() !== "") {
-      try {
-        requests = await extractWithGemini(geminiKey, geminiModel, filteredText, today);
-      } catch (_e) {
-        warnings.push("Gemini extraction failed; used fallback parser.");
-        requests = null;
-      }
-    } else if (!geminiKey) {
-      warnings.push("GEMINI_API_KEY not set; used fallback parser.");
-    }
-    if (requests === null) {
-      requests = fallbackExtract(processed, today);
-    }
+    const requests = await extractRequests(
+      geminiKey,
+      geminiModel,
+      processed,
+      today,
+      warnings,
+    );
 
     // --- Resolve customers (students) ----------------------------------
     // Per distinct sender, decide link_status (linked / needs_review /
@@ -364,12 +385,14 @@ serve(async (req: Request): Promise<Response> => {
     // --- Insert the extracted requests ---------------------------------
     let insertedIds: string[] = [];
     if (rows.length > 0) {
+      const tReq = Date.now();
       const { data: insertedReqs, error: reqErr } = await supabase
         .from("meal_requests")
         .insert(rows)
         .select("id");
       if (reqErr) throw reqErr;
       insertedIds = (insertedReqs ?? []).map((r) => r.id as string);
+      logTiming("meal_requests_insert", Date.now() - tReq, { count: rows.length });
     }
 
     // --- Record the duplicate links ------------------------------------
@@ -437,10 +460,15 @@ serve(async (req: Request): Promise<Response> => {
       .eq("id", importId)
       .eq("owner_id", ownerId);
 
+    logTiming("total", Date.now() - t0, {
+      processed: processedMessages,
+      extracted: insertedIds.length,
+    });
     return json({ importId, status: "completed", summary, warnings }, 200);
   } catch (e) {
     // Mark the import failed and return a useful message to the client.
     const message = e instanceof Error ? e.message : "Import failed.";
+    logTiming("total_failed", Date.now() - t0, {});
     try {
       await supabase
         .from("chat_imports")
@@ -450,8 +478,16 @@ serve(async (req: Request): Promise<Response> => {
     } catch (_e) {
       // best-effort; nothing more we can do here.
     }
+    // A timeout / abort almost always means the export was too big to finish in
+    // one import — give the owner an actionable hint instead of a generic error.
+    const low = message.toLowerCase();
+    const looksTooLarge = low.includes("timeout") || low.includes("timed out") ||
+      low.includes("abort") || low.includes("deadline");
+    const userError = looksTooLarge
+      ? "This WhatsApp export is too large to process in one import. Try a smaller date range or import recent chat only."
+      : "Import failed while processing. Please try again.";
     return json(
-      { importId, status: "failed", error: "Import failed while processing. Please try again.", summary: emptySummary(), warnings },
+      { importId, status: "failed", error: userError, summary: emptySummary(), warnings },
       200,
     );
   }
@@ -749,28 +785,38 @@ interface RosterResult {
   ambiguous: number; // names that matched >1 customer (left for review)
 }
 
-// Create or match a customer for each parsed join/add name, using the SAME
+// CREATE or MATCH a customer for each parsed join/add name. Priya opens a fresh
+// WhatsApp group for her CURRENT active mess students, so everyone who joins (or
+// was added) is an active customer and should exist in the app. We use the SAME
 // conservative matching the meal-request resolver uses (unique phone, unique
-// alias, unique name). The new member's WhatsApp display name is preserved
-// verbatim as the customer name and stored as a normalized alias so future meal
-// requests link exactly. Duplicate protection:
-//   * Same normalized name seen twice in one import -> handled once.
-//   * Name already mapping to exactly one customer -> matched, never duplicated.
-//   * Name mapping to >1 active customer -> ambiguous: NEVER merged/created,
-//     left for the owner to resolve.
-//   * Phone-shaped join name (an unsaved contact) is matched by phone only and
-//     never spawns a customer named after a number.
-// No fake phone numbers or plan amounts are ever written; new customers are
-// active with monthly_plan defaulting to 0 (needs plan setup later).
+// alias, unique name); a name that matches no existing active customer is
+// created as a new active customer so a later meal message from that person
+// links automatically (normal Approve, not "Resolve first").
+//
+// Performance: a long export can carry hundreds of join events. We do NOT do one
+// INSERT per name (the old hang). Instead we classify every distinct name first
+// (matched / ambiguous / to-create), then bulk-insert the new students in one
+// round trip and the aliases in a second — at most four DB calls total
+// regardless of roster size.
+//
+// Outcomes per distinct join name:
+//   * Maps to exactly one existing customer (phone/alias/name) -> matched.
+//   * Maps to >1 active customer -> ambiguous (left for the owner to resolve);
+//     never blindly duplicated.
+//   * Phone-shaped name (unsaved contact) -> matched only if one phone matches;
+//     never spawns a customer named after a number (counted as ambiguous).
+//   * No active match -> created as a new active customer.
 async function onboardRoster(
   supabase: SupabaseClient,
   ownerId: string,
   rawNames: string[],
-  _importId: string | null, // reserved; students has no last_seen/import_id column
+  warnings: string[],
 ): Promise<RosterResult> {
   const result: RosterResult = { found: 0, created: 0, matched: 0, ambiguous: 0 };
 
   // Dedupe within this import by normalized key; keep the first-seen display.
+  // isUnreliableSender drops empty / "Unknown" / symbol-only names, so we never
+  // create a customer named "Unknown" or from a symbol-only line.
   const distinct = new Map<string, string>(); // nameKey -> display name
   for (const n of rawNames) {
     if (isUnreliableSender(n)) continue;
@@ -781,7 +827,7 @@ async function onboardRoster(
   if (distinct.size === 0) return result;
   result.found = distinct.size;
 
-  // Snapshot existing customers + aliases (mirrors resolveSenders).
+  // Snapshot existing customers + aliases ONCE (mirrors resolveSenders).
   const { data: students } = await supabase
     .from("students")
     .select("id, name, phone, status, active")
@@ -814,22 +860,19 @@ async function onboardRoster(
     if (activeIds.has(sid)) pushId(activeByAlias, ak, sid);
   }
 
-  // Best-effort alias upsert: never fail the whole import over an alias write,
-  // and never repoint an alias that already maps somewhere (unique index).
-  const ensureAlias = async (studentId: string, display: string, key: string) => {
-    if (existingAliasKeys.has(key)) return;
-    try {
-      await supabase.from("student_aliases").insert({
-        owner_id: ownerId,
-        student_id: studentId,
-        alias: display,
-        normalized_alias: key,
-      });
-      existingAliasKeys.add(key);
-    } catch (_e) {
-      // ignore — exact future matching still works via the unique name.
-    }
+  // Collect alias rows to insert in ONE bulk write at the end. seenAliasKeys
+  // guards both pre-existing aliases (unique index on owner+normalized_alias)
+  // and within-batch duplicates.
+  const seenAliasKeys = new Set<string>(existingAliasKeys);
+  const aliasRows: Array<{ owner_id: string; student_id: string; alias: string; normalized_alias: string }> = [];
+  const queueAlias = (studentId: string, display: string, key: string) => {
+    if (key === "" || seenAliasKeys.has(key)) return;
+    seenAliasKeys.add(key);
+    aliasRows.push({ owner_id: ownerId, student_id: studentId, alias: display, normalized_alias: key });
   };
+
+  // Names with no active match — created in bulk below.
+  const toCreate: Array<{ key: string; display: string }> = [];
 
   for (const [key, display] of distinct.entries()) {
     // Phone-shaped join name (unsaved contact): match by phone only; never
@@ -851,31 +894,56 @@ async function onboardRoster(
     const nm = activeByName.get(key) ?? [];
     if (nm.length === 1) {
       // Store the verbatim WhatsApp name as an alias for exact future matching.
-      await ensureAlias(nm[0], display, key);
+      queueAlias(nm[0], display, key);
       result.matched++;
       continue;
     }
+    // 3. >1 active customer already share this name — never blindly duplicate;
+    //    leave ambiguous for the owner to resolve in review.
     if (nm.length > 1) { result.ambiguous++; continue; }
 
-    // 3. No match -> create a new active customer with the WhatsApp name.
+    // 4. No active match -> create a new active customer. Deferred to the bulk
+    //    insert below so a big roster is one round trip, not one INSERT per name.
+    toCreate.push({ key, display });
+  }
+
+  // --- Bulk-create the new active customers in a single round trip ----------
+  if (toCreate.length > 0) {
     try {
-      const { data: created, error: insErr } = await supabase
+      const insertRows = toCreate.map((c) => ({
+        owner_id: ownerId,
+        name: c.display,
+        status: "active",
+      }));
+      const { data: created, error } = await supabase
         .from("students")
-        .insert({ owner_id: ownerId, name: display, status: "active" })
-        .select("id")
-        .single();
-      if (insErr || !created) throw insErr ?? new Error("insert failed");
-      const newId = created.id as string;
-      // Reflect into the in-memory snapshot so a later same-name event in THIS
-      // import matches it instead of creating a duplicate.
-      pushId(activeByName, key, newId);
-      activeIds.add(newId);
-      await ensureAlias(newId, display, key);
-      result.created++;
+        .insert(insertRows)
+        .select("id, name");
+      if (error) throw error;
+      result.created = created?.length ?? 0;
+      // Store each created student's WhatsApp display name as an alias too, so
+      // resolveSenders links a later meal message by alias as well as by name.
+      for (const row of created ?? []) {
+        const id = row.id as string;
+        const nm = (row.name as string) ?? "";
+        if (id) queueAlias(id, nm, nameKey(nm));
+      }
+    } catch (e) {
+      // Don't fail the whole import over roster creation; report the names as
+      // skipped/needs-review and warn. The owner can add them manually.
+      const msg = e instanceof Error ? e.message : String(e);
+      console.error("[extract-requests] roster bulk create failed.", JSON.stringify({ count: toCreate.length, error: msg }));
+      warnings.push("Some new students from group join events could not be created automatically — add them from the Customers screen.");
+      result.ambiguous += toCreate.length;
+    }
+  }
+
+  // --- Bulk-insert the collected aliases (best effort) ----------------------
+  if (aliasRows.length > 0) {
+    try {
+      await supabase.from("student_aliases").insert(aliasRows);
     } catch (_e) {
-      // Could not create (e.g. transient) — surface as ambiguous/needs review
-      // rather than silently dropping the roster name.
-      result.ambiguous++;
+      // Best effort: exact future matching still works via the unique name.
     }
   }
 
@@ -943,31 +1011,172 @@ async function loadExistingDupKeys(
 }
 
 // ---------------------------------------------------------------------------
-// Gemini
+// Candidate filtering + batched Gemini extraction
 // ---------------------------------------------------------------------------
-async function extractWithGemini(
+// A WhatsApp export is mostly chatter. Sending all of it to Gemini is slow and
+// pointless, so we first reduce the in-window messages to CANDIDATES — the ones
+// that look like an actual mess request (meal/cancel/pause/payment/dues). Only
+// candidates are sent to Gemini, in batches, each with its own timeout.
+
+// A candidate is just a processed ChatMessage that survived the prefilter. Its
+// position within its Gemini batch is the stable "#<index>" used in the prompt,
+// so the model's output maps back to the exact original message (and its stored
+// chat_messages row) even if the model rephrases the text.
+type Candidate = ChatMessage;
+
+// Keyword signal for "this message might be an actionable mess request". Kept
+// deliberately broad (Hinglish + English) — precision is Gemini's job; this is
+// only a cheap prefilter to cut volume. Anything matched here still goes to the
+// model (or the fallback parser) for the real decision.
+const CANDIDATE_RE =
+  /(lunch|dinner|meal|tiffin|dabba|mess|khana|khane|roti|rice|sabzi|plate|cancel|nahi|nahin|nhi|mat banana|mat bhejna|skip|band|bandh|chhutti|chutti|pause|ghar ja|out of station|start|resume|restart|chalu|shuru|continue|payment|paid|pay kar|bhej diya|de diya|transfer|upi|gpay|phonepe|paytm|due|baki|balance|hisab|hisaab|kitna|add|extra|badha|zyada)/;
+
+function isCandidate(text: string): boolean {
+  const lower = normalize(text);
+  if (isNoise(lower)) return false;
+  return CANDIDATE_RE.test(lower);
+}
+
+function buildCandidates(processed: ChatMessage[]): Candidate[] {
+  return processed.filter((m) => isCandidate(m.text));
+}
+
+// Orchestrate extraction over the candidate messages. Sends Gemini one batch at
+// a time (with a per-batch timeout); a batch that fails or times out falls back
+// to the rule-based parser for THAT batch only, so the rest of the import still
+// benefits from Gemini. Returns the merged requests. Never throws — extraction
+// problems degrade to the fallback parser rather than failing the import.
+async function extractRequests(
+  geminiKey: string | undefined,
+  geminiModel: string,
+  processed: ChatMessage[],
+  today: string,
+  warnings: string[],
+): Promise<ExtractedRequest[]> {
+  const tCand = Date.now();
+  const candidates = buildCandidates(processed);
+  logTiming("candidates", Date.now() - tCand, {
+    processed: processed.length,
+    candidates: candidates.length,
+  });
+
+  if (candidates.length === 0) return [];
+
+  // No key configured -> straight to the fallback parser for all candidates.
+  if (!geminiKey) {
+    console.warn("[extract-requests] GEMINI_API_KEY is not set — using fallback parser.");
+    warnings.push("GEMINI_API_KEY not set; used fallback parser.");
+    return fallbackExtract(candidates, today);
+  }
+
+  const batches: Candidate[][] = [];
+  for (let i = 0; i < candidates.length; i += GEMINI_BATCH_SIZE) {
+    batches.push(candidates.slice(i, i + GEMINI_BATCH_SIZE));
+  }
+
+  const out: ExtractedRequest[] = [];
+  let failedBatches = 0;
+  const tGem = Date.now();
+  for (let b = 0; b < batches.length; b++) {
+    const batch = batches[b];
+    const tBatch = Date.now();
+    try {
+      const reqs = await extractCandidatesWithGemini(geminiKey, geminiModel, batch, today);
+      logTiming("gemini_batch", Date.now() - tBatch, {
+        batch: b,
+        candidates: batch.length,
+        requests: reqs.length,
+      });
+      out.push(...reqs);
+    } catch (e) {
+      // Log the REAL failure (safe fields only: no key, no chat text), then fall
+      // back for just this batch so other batches keep their Gemini results.
+      const errMsg = e instanceof Error ? e.message : String(e);
+      console.error(
+        "[extract-requests] Gemini batch failed — using fallback parser for this batch.",
+        JSON.stringify({
+          batch: b,
+          geminiKeyPresent: true, // boolean only, never the key
+          geminiModel,
+          geminiError: errMsg, // includes "Gemini HTTP <status>: …" or "timeout"
+          usedFallback: true,
+        }),
+      );
+      logTiming("gemini_batch_failed", Date.now() - tBatch, { batch: b, candidates: batch.length });
+      failedBatches++;
+      out.push(...fallbackExtract(batch, today));
+    }
+  }
+  logTiming("gemini_total", Date.now() - tGem, {
+    batches: batches.length,
+    failedBatches,
+    requests: out.length,
+  });
+
+  if (failedBatches > 0) {
+    warnings.push(
+      failedBatches === batches.length
+        ? "Gemini extraction failed; used fallback parser."
+        : "Gemini extraction failed for part of this import; used fallback parser for those messages.",
+    );
+  }
+  return out;
+}
+
+// One Gemini batch. Sends only the candidate messages (each with its stable
+// index), enforces a timeout via AbortController, and maps each returned request
+// back to its source candidate by `messageIndex` so the original sender + text
+// are authoritative (the model can rephrase; we don't trust it for identity).
+async function extractCandidatesWithGemini(
   apiKey: string,
   model: string,
-  chatText: string,
+  batch: Candidate[],
   today: string,
 ): Promise<ExtractedRequest[]> {
   const url =
     `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
 
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      contents: [{ role: "user", parts: [{ text: buildPrompt(chatText, today) }] }],
-      generationConfig: {
-        temperature: 0.1,
-        responseMimeType: "application/json",
-      },
-    }),
-  });
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_MS);
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ role: "user", parts: [{ text: buildPrompt(batch, today) }] }],
+        generationConfig: {
+          temperature: 0.1,
+          responseMimeType: "application/json",
+        },
+      }),
+      signal: controller.signal,
+    });
+  } catch (e) {
+    // AbortError -> surface as a timeout so the caller's user-facing message and
+    // the fallback path both kick in. Re-throw anything else as-is.
+    if (e instanceof DOMException && e.name === "AbortError") {
+      throw new Error(`Gemini request timed out after ${GEMINI_TIMEOUT_MS}ms`);
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
 
   if (!res.ok) {
-    throw new Error(`Gemini HTTP ${res.status}`);
+    // Read a short body snippet so the real cause (bad key, wrong model,
+    // quota exceeded, …) reaches the logs. The body is Gemini's own error
+    // JSON — it never contains our API key (the key is only in the URL, which
+    // we do NOT include here). Cap the snippet to keep logs small.
+    let snippet = "";
+    try {
+      snippet = (await res.text()).slice(0, 500).replace(/\s+/g, " ").trim();
+    } catch (_e) {
+      // body unreadable — status alone still tells us a lot.
+    }
+    throw new Error(
+      snippet ? `Gemini HTTP ${res.status}: ${snippet}` : `Gemini HTTP ${res.status}`,
+    );
   }
   const data = await res.json();
   const text: string | undefined =
@@ -978,20 +1187,44 @@ async function extractWithGemini(
   const arr = Array.isArray(parsed) ? parsed : parsed?.requests;
   if (!Array.isArray(arr)) throw new Error("Unexpected Gemini JSON shape");
 
-  return arr
-    .map((r) => normalizeRequest(r, today))
-    .filter((r): r is ExtractedRequest => r !== null);
+  const out: ExtractedRequest[] = [];
+  for (const raw of arr) {
+    const req = normalizeRequest(raw, today);
+    if (!req) continue;
+    // Map back to the source candidate by index when the model returned one.
+    // The candidate's sender + verbatim text are authoritative, so message_id
+    // linking (which matches on original_message) always succeeds.
+    const idxRaw = raw?.messageIndex ?? raw?.message_index ?? raw?.index;
+    const idx = Number(idxRaw);
+    if (Number.isInteger(idx) && idx >= 0 && idx < batch.length) {
+      const src = batch[idx];
+      req.studentName = cleanSender(src.sender);
+      req.originalMessage = src.text;
+    }
+    out.push(req);
+  }
+  return out;
 }
 
-function buildPrompt(chatText: string, today: string): string {
-  return `You extract structured mess (canteen/tiffin) requests from a WhatsApp
-group chat for an Indian "Kota mess" owner. Students message in mixed
+function buildPrompt(batch: Candidate[], today: string): string {
+  // Pre-filtered candidate messages, one per line. The "#<index>" is the
+  // BATCH-LOCAL position (0-based) so it maps straight back via batch[idx] in
+  // extractCandidatesWithGemini — each batch is its own Gemini call.
+  const lines = batch
+    .map((c, i) => `#${i} ${c.dateText ? `[${c.dateText}] ` : ""}${c.sender}: ${c.text}`)
+    .join("\n");
+
+  return `You extract structured mess (canteen/tiffin) requests from WhatsApp
+messages for an Indian "Kota mess" owner. Students message in mixed
 Hinglish / Hindi / English. Today's date is ${today} (ISO, Asia/Kolkata).
+
+The messages below are PRE-FILTERED candidates, each prefixed with "#<index>".
 
 Return ONLY a JSON object of this exact shape:
 {
   "requests": [
     {
+      "messageIndex": number,       // the #<index> of the source message
       "studentName": string,        // sender's name; never invent one
       "originalMessage": string,    // the message text, preserved
       "requestType": one of [${REQUEST_TYPES.map((t) => `"${t}"`).join(", ")}],
@@ -1017,6 +1250,7 @@ Request type guidance:
 - unclear: mess-related but ambiguous (low confidence).
 
 Rules:
+- Always include the source "messageIndex" for every request.
 - Do NOT invent student names; use the chat sender's name.
 - Preserve the original message text exactly in originalMessage.
 - If the date is unclear, set requestDate to null and dateLabel to "unspecified".
@@ -1028,9 +1262,9 @@ Rules:
 - Return ONLY actionable/relevant requests. Ignore greetings, emoji-only lines,
   "<Media omitted>", deleted messages, links, and unrelated chatter.
 
-WhatsApp chat:
+Messages:
 """
-${chatText.slice(0, 20000)}
+${lines.slice(0, 20000)}
 """`;
 }
 
@@ -1217,7 +1451,6 @@ interface MealTime {
 }
 
 interface CutoffSettings {
-  breakfast: MealTime | null;
   lunch: MealTime | null;
   dinner: MealTime | null;
   cutoffMinutes: number;
@@ -1251,7 +1484,6 @@ async function loadCutoffSettings(
   ownerId: string,
 ): Promise<CutoffSettings> {
   const fallback: CutoffSettings = {
-    breakfast: null,
     lunch: null,
     dinner: null,
     cutoffMinutes: DEFAULT_CUTOFF_MINUTES,
@@ -1259,13 +1491,12 @@ async function loadCutoffSettings(
   try {
     const { data } = await supabase
       .from("owner_profiles")
-      .select("breakfast_time, lunch_time, dinner_time, request_cutoff_minutes")
+      .select("lunch_time, dinner_time, request_cutoff_minutes")
       .eq("id", ownerId)
       .maybeSingle();
     if (!data) return fallback;
     const cm = Number(data.request_cutoff_minutes);
     return {
-      breakfast: parseTimeOfDay(data.breakfast_time),
       lunch: parseTimeOfDay(data.lunch_time),
       dinner: parseTimeOfDay(data.dinner_time),
       cutoffMinutes: Number.isFinite(cm) && cm >= 0 ? cm : DEFAULT_CUTOFF_MINUTES,
@@ -1285,8 +1516,6 @@ function bindingMeal(
   s: CutoffSettings,
 ): { time: MealTime; label: string } | null {
   switch (mealType) {
-    case "breakfast":
-      return s.breakfast ? { time: s.breakfast, label: "breakfast" } : null;
     case "lunch":
       return s.lunch ? { time: s.lunch, label: "lunch" } : null;
     case "dinner":

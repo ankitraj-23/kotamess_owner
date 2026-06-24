@@ -208,7 +208,6 @@ class _MealPlanFormSheetState extends State<_MealPlanFormSheet> {
   final _formKey = GlobalKey<FormState>();
   late final TextEditingController _name;
   late final TextEditingController _monthly;
-  late bool _breakfast;
   late bool _lunch;
   late bool _dinner;
   late bool _active;
@@ -226,7 +225,6 @@ class _MealPlanFormSheetState extends State<_MealPlanFormSheet> {
         text: e == null || e.monthlyPrice == 0
             ? ''
             : e.monthlyPrice.toStringAsFixed(0));
-    _breakfast = e?.breakfastEnabled ?? false;
     _lunch = e?.lunchEnabled ?? true;
     _dinner = e?.dinnerEnabled ?? true;
     _active = e?.isActive ?? true;
@@ -241,7 +239,7 @@ class _MealPlanFormSheetState extends State<_MealPlanFormSheet> {
 
   Future<void> _save() async {
     if (!_formKey.currentState!.validate()) return;
-    if (!_breakfast && !_lunch && !_dinner) {
+    if (!_lunch && !_dinner) {
       setState(() => _error = 'Enable at least one meal.');
       return;
     }
@@ -252,7 +250,6 @@ class _MealPlanFormSheetState extends State<_MealPlanFormSheet> {
     final base = widget.existing ?? const MealPlan(id: '', name: '');
     final plan = base.copyWith(
       name: _name.text.trim(),
-      breakfastEnabled: _breakfast,
       lunchEnabled: _lunch,
       dinnerEnabled: _dinner,
       monthlyPrice: num.tryParse(_monthly.text.trim()) ?? 0,
@@ -305,12 +302,6 @@ class _MealPlanFormSheetState extends State<_MealPlanFormSheet> {
                     (v == null || v.trim().isEmpty) ? 'Enter a name' : null,
               ),
               const SizedBox(height: 8),
-              SwitchListTile(
-                contentPadding: EdgeInsets.zero,
-                title: const Text('Breakfast'),
-                value: _breakfast,
-                onChanged: (v) => setState(() => _breakfast = v),
-              ),
               SwitchListTile(
                 contentPadding: EdgeInsets.zero,
                 title: const Text('Lunch'),

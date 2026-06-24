@@ -80,27 +80,12 @@ class DailyScreenState extends State<DailyScreen> {
     reload();
   }
 
-  @override
-  void didUpdateWidget(DailyScreen oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    // Base counts changed in Settings: recompute the breakdown.
-    if (oldWidget.profile.defaultLunchCount !=
-            widget.profile.defaultLunchCount ||
-        oldWidget.profile.defaultDinnerCount !=
-            widget.profile.defaultDinnerCount) {
-      reload();
-    }
-  }
-
   /// Public so the shell can refresh when this tab becomes visible.
   Future<void> reload() async {
     if (mounted) setState(() => _error = null);
     try {
-      final summary = await widget.databaseService.fetchDailySummary(
-        date: _dateStr,
-        baseLunch: widget.profile.defaultLunchCount,
-        baseDinner: widget.profile.defaultDinnerCount,
-      );
+      final summary =
+          await widget.databaseService.fetchDailySummary(date: _dateStr);
       if (!mounted) return;
       setState(() {
         _summary = summary;
@@ -230,8 +215,8 @@ class DailyScreenState extends State<DailyScreen> {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
-                  'Base count from Settings, ± approved request adjustments, '
-                  '± manual adjustments for this date.',
+                  'Base count = active customers, ± approved request '
+                  'adjustments, ± manual adjustments for this date.',
                   style: TextStyle(color: Colors.grey.shade600, fontSize: 12),
                 ),
                 const SizedBox(height: 10),
@@ -436,7 +421,7 @@ class _BreakdownTable extends StatelessWidget {
         Text(label,
             style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 15)),
         const SizedBox(height: 6),
-        _row('Base count (from Settings)', '$base'),
+        _row('Base count (active customers)', '$base'),
         _row('Approved additions', added == 0 ? '0' : '+$added'),
         _row('Approved cancellations', cancelled == 0 ? '0' : '-$cancelled'),
         _row('Manual adjustments (this date)',

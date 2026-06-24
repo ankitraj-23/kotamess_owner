@@ -306,6 +306,32 @@ the Flutter `.env`, never logged, and never returned to the client.
 4. Tap **Review _N_ request(s)** → you're taken to the **Requests** tab to
    approve / reject them.
 
+### f. Diagnosing the "fallback parser" banner
+
+If the orange *"Gemini extraction failed; used fallback parser"* banner appears,
+the server fell back to the rule-based parser. The **real cause is logged
+server-side** (never shown in the app). Check it like this:
+
+1. Confirm the secrets are set, then redeploy so the function picks them up:
+   ```bash
+   supabase secrets set GEMINI_API_KEY="YOUR_KEY"     # never commit this value
+   supabase secrets set GEMINI_MODEL="gemini-2.5-flash"
+   supabase secrets list                              # shows names only, not values
+   supabase functions deploy extract-requests
+   ```
+2. Trigger an import from the app (Import → Insert sample → Import & extract).
+3. Read the logs: **Supabase Dashboard → Edge Functions → `extract-requests` →
+   Logs** (or `supabase functions logs extract-requests`). Look for the line
+   `[extract-requests] Gemini extraction failed …`, which logs only safe fields:
+   whether the key is present (boolean), the selected model, and Gemini's own
+   error message including the HTTP status (e.g. `Gemini HTTP 400: …`,
+   `Gemini HTTP 429: …` quota, `Gemini HTTP 404: …` unknown model).
+
+Common causes by status: **400/403** invalid or restricted API key · **404**
+unsupported `GEMINI_MODEL` · **429** quota/rate limit · empty/unexpected JSON →
+`Empty Gemini response` / `Unexpected Gemini JSON shape`. The API key is never
+logged or returned to the client.
+
 ---
 
 ## Project layout (backend + auth + extraction)

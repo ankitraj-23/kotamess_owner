@@ -1,4 +1,7 @@
+import 'billing_defaults.dart';
 import 'ledger_entry.dart';
+import 'meal_plan.dart';
+import 'meal_request.dart';
 import 'student.dart';
 
 /// Mirror of a row in `payments` — money actually received from a customer.
@@ -75,16 +78,88 @@ class CustomerBalance {
   final num totalCharges;
   final num totalPayments;
 
+  /// Current-month billing summary (drives the Ledger "Balances" view).
+  ///
+  ///   adjustedBill = max(0, baseMonthlyBill - cancellationCredit)
+  ///   remaining    = max(0, adjustedBill - paidThisMonth)
+  ///
+  /// [baseMonthlyBill] is the assigned plan's monthly price, or
+  /// [BillingDefaults.monthlyBill] (₹3900) when the customer has no plan.
+  final num baseMonthlyBill;
+  final num cancellationCredit;
+  final num paidThisMonth;
+  final String planName; // assigned plan name, '' when none
+
   const CustomerBalance({
     required this.student,
     required this.totalCharges,
     required this.totalPayments,
+    this.baseMonthlyBill = 0,
+    this.cancellationCredit = 0,
+    this.paidThisMonth = 0,
+    this.planName = '',
   });
 
   /// Positive = customer owes this much; negative = customer is in credit.
   num get balance => totalCharges - totalPayments;
   bool get owes => balance > 0;
   bool get inCredit => balance < 0;
+
+  /// Monthly bill after approved meal-cancellation credits, never negative.
+  num get adjustedBill {
+    final v = baseMonthlyBill - cancellationCredit;
+    return v < 0 ? 0 : v;
+  }
+
+  /// Outstanding for the current month after approved payments, never negative.
+  num get remaining {
+    final v = adjustedBill - paidThisMonth;
+    return v < 0 ? 0 : v;
+  }
+
+  /// Current-month payment status: 'pending' | 'partial' | 'settled'.
+  /// A zero adjusted bill (e.g. fully credited) counts as settled / no due.
+  String get billStatus {
+    if (adjustedBill <= 0) return 'settled';
+    if (paidThisMonth <= 0) return 'pending';
+    if (paidThisMonth < adjustedBill) return 'partial';
+    return 'settled';
+  }
+
+  String get billStatusLabel {
+    switch (billStatus) {
+      case 'pending':
+        return 'Pending';
+      case 'partial':
+        return 'Partial';
+      default:
+        return 'Settled';
+    }
+  }
+
+  /// Credit a single approved cancellation request earns, using the assigned
+  /// plan's per-meal prices when set, otherwise the Priya Mess defaults:
+  ///   lunch → ₹50, dinner → ₹80, both / full day → ₹130.
+  static num cancellationCreditOf(MealRequest r, MealPlan? plan) {
+    final lunch = (plan != null && plan.lunchPrice > 0)
+        ? plan.lunchPrice
+        : BillingDefaults.lunchPrice;
+    final dinner = (plan != null && plan.dinnerPrice > 0)
+        ? plan.dinnerPrice
+        : BillingDefaults.dinnerPrice;
+    if (r.requestType == 'both_meals_cancel') return lunch + dinner;
+    if (r.requestType != 'cancel_meal') return 0;
+    switch (r.mealType) {
+      case 'lunch':
+        return lunch;
+      case 'dinner':
+        return dinner;
+      case 'both':
+        return lunch + dinner;
+      default:
+        return 0;
+    }
+  }
 
   /// Copyable reminder text for the customer's outstanding balance.
   String reminderMessage() {

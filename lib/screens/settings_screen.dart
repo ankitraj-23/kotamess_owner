@@ -16,6 +16,7 @@ class SettingsScreen extends StatefulWidget {
     required this.databaseService,
     required this.onProfileUpdated,
     required this.onSignOut,
+    required this.onDataReset,
   });
 
   final OwnerProfile profile;
@@ -23,6 +24,10 @@ class SettingsScreen extends StatefulWidget {
   final DatabaseService databaseService;
   final ValueChanged<OwnerProfile> onProfileUpdated;
   final VoidCallback onSignOut;
+
+  /// Called after "Reset app data" succeeds so the shell can refresh every tab
+  /// (including clearing the still-mounted Import screen's local draft).
+  final VoidCallback onDataReset;
 
   @override
   State<SettingsScreen> createState() => _SettingsScreenState();
@@ -33,18 +38,16 @@ class _SettingsScreenState extends State<SettingsScreen> {
   late final TextEditingController _ownerName;
   late final TextEditingController _messName;
   late final TextEditingController _phone;
-  late final TextEditingController _lunch;
-  late final TextEditingController _dinner;
   late final TextEditingController _retention;
   late final TextEditingController _cutoffMinutes;
 
   // Meal serving times, edited via the native time picker.
-  late TimeOfDay _breakfastTime;
   late TimeOfDay _lunchTime;
   late TimeOfDay _dinnerTime;
 
   bool _saving = false;
   bool _cleaning = false;
+  bool _resetting = false;
 
   @override
   void initState() {
@@ -53,11 +56,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _ownerName = TextEditingController(text: p.ownerName);
     _messName = TextEditingController(text: p.messName);
     _phone = TextEditingController(text: p.phone);
-    _lunch = TextEditingController(text: '${p.defaultLunchCount}');
-    _dinner = TextEditingController(text: '${p.defaultDinnerCount}');
     _retention = TextEditingController(text: '${p.retentionDays}');
     _cutoffMinutes = TextEditingController(text: '${p.requestCutoffMinutes}');
-    _breakfastTime = _parseTime(p.breakfastTime, const TimeOfDay(hour: 8, minute: 0));
     _lunchTime = _parseTime(p.lunchTime, const TimeOfDay(hour: 13, minute: 0));
     _dinnerTime = _parseTime(p.dinnerTime, const TimeOfDay(hour: 20, minute: 0));
   }
@@ -67,8 +67,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _ownerName.dispose();
     _messName.dispose();
     _phone.dispose();
-    _lunch.dispose();
-    _dinner.dispose();
     _retention.dispose();
     _cutoffMinutes.dispose();
     super.dispose();
@@ -104,10 +102,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       ownerName: _ownerName.text.trim(),
       messName: _messName.text.trim(),
       phone: _phone.text.trim(),
-      defaultLunchCount: int.parse(_lunch.text.trim()),
-      defaultDinnerCount: int.parse(_dinner.text.trim()),
       retentionDays: int.parse(_retention.text.trim()),
-      breakfastTime: _formatTime(_breakfastTime),
       lunchTime: _formatTime(_lunchTime),
       dinnerTime: _formatTime(_dinnerTime),
       requestCutoffMinutes: int.parse(_cutoffMinutes.text.trim()),
@@ -236,16 +231,41 @@ class _SettingsScreenState extends State<SettingsScreen> {
     );
   }
 
+  /// Dangerous: deletes ALL app data for the current signed-in account (but not
+  /// the account/email/password itself). Two-step confirm; the final delete is
+  /// only enabled after the owner types `RESET`.
+  Future<void> _resetData() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (_) => const _ResetDataDialog(),
+    );
+    if (confirmed != true) return;
+    setState(() => _resetting = true);
+    try {
+      await widget.databaseService.resetCurrentOwnerData();
+      // Pull the (preserved) profile back with its operational values reset, so
+      // the rest of the app rebuilds against a fresh, empty account.
+      final fresh = await widget.profileService.fetchProfile();
+      if (!mounted) return;
+      if (fresh != null) widget.onProfileUpdated(fresh);
+      // Refresh every tab and clear the Import screen's local draft, even
+      // though it stays mounted in the bottom-tab shell.
+      widget.onDataReset();
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('All app data was reset for your account.')),
+      );
+      Navigator.of(context).pop(); // back to a fresh dashboard
+    } catch (_) {
+      if (!mounted) return;
+      setState(() => _resetting = false);
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Could not reset data. Please try again.')),
+      );
+    }
+  }
+
   String? _notEmpty(String? v, String field) =>
       (v == null || v.trim().isEmpty) ? 'Enter $field' : null;
-
-  String? _count(String? v) {
-    final n = int.tryParse((v ?? '').trim());
-    if (n == null) return 'Enter a number';
-    if (n < 0) return 'Cannot be negative';
-    if (n > 100000) return 'Too large';
-    return null;
-  }
 
   String? _retentionValidator(String? v) {
     final n = int.tryParse((v ?? '').trim());
@@ -305,48 +325,20 @@ class _SettingsScreenState extends State<SettingsScreen> {
               ],
             ),
             const SizedBox(height: 16),
-            _SettingsCard(
+            const _SettingsCard(
               title: 'Default daily counts',
               icon: Icons.restaurant_menu,
               children: [
-                const Text(
-                  'Used as the base count for every day. These default counts '
-                  'are used every day until you change them.',
+                Text(
+                  'The base lunch and dinner count for every day is automatically '
+                  'your current number of active customers. Pausing or removing a '
+                  'customer lowers it; adding one raises it.',
                   style: TextStyle(color: Colors.black54, fontSize: 13),
                 ),
-                const SizedBox(height: 6),
-                const Text(
-                  'Change this only when your regular mess strength changes. '
+                SizedBox(height: 6),
+                Text(
                   'For one-day changes, use Daily → manual adjustments instead.',
                   style: TextStyle(color: Colors.black54, fontSize: 13),
-                ),
-                const SizedBox(height: 12),
-                Row(
-                  children: [
-                    Expanded(
-                      child: TextFormField(
-                        controller: _lunch,
-                        keyboardType: TextInputType.number,
-                        decoration: const InputDecoration(
-                          labelText: 'Base lunch',
-                          prefixIcon: Icon(Icons.lunch_dining),
-                        ),
-                        validator: _count,
-                      ),
-                    ),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: TextFormField(
-                        controller: _dinner,
-                        keyboardType: TextInputType.number,
-                        decoration: const InputDecoration(
-                          labelText: 'Base dinner',
-                          prefixIcon: Icon(Icons.dinner_dining),
-                        ),
-                        validator: _count,
-                      ),
-                    ),
-                  ],
                 ),
               ],
             ),
@@ -360,14 +352,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   'send a change, cancel, add or delay request. Requests that '
                   'arrive later than the cutoff are flagged for your review.',
                   style: TextStyle(color: Colors.black54, fontSize: 13),
-                ),
-                const SizedBox(height: 12),
-                _TimeField(
-                  label: 'Breakfast time',
-                  icon: Icons.free_breakfast_outlined,
-                  time: _breakfastTime,
-                  onTap: () => _pickTime(
-                      _breakfastTime, (t) => setState(() => _breakfastTime = t)),
                 ),
                 const SizedBox(height: 12),
                 _TimeField(
@@ -544,6 +528,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   'You can request deletion of your account and all associated '
                   'data at any time.',
                 ),
+                const _BulletPoint(
+                  'Reset app data clears your customers, imports, requests, '
+                  'daily adjustments, ledger, payments, meal plans, bills and '
+                  'audit logs — but keeps your account so you can start fresh.',
+                ),
                 const SizedBox(height: 12),
                 SizedBox(
                   width: double.infinity,
@@ -554,6 +543,23 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       foregroundColor: const Color(0xFFDC2626),
                     ),
                     label: const Text('Request account deletion'),
+                  ),
+                ),
+                const SizedBox(height: 8),
+                SizedBox(
+                  width: double.infinity,
+                  child: FilledButton.icon(
+                    onPressed: _resetting ? null : _resetData,
+                    icon: _resetting
+                        ? const SizedBox(
+                            height: 18,
+                            width: 18,
+                            child: CircularProgressIndicator(strokeWidth: 2))
+                        : const Icon(Icons.restart_alt),
+                    style: FilledButton.styleFrom(
+                      backgroundColor: const Color(0xFFDC2626),
+                    ),
+                    label: const Text('Reset app data'),
                   ),
                 ),
               ],
@@ -664,6 +670,80 @@ class _BulletPoint extends StatelessWidget {
           ),
         ],
       ),
+    );
+  }
+}
+
+/// Two-step destructive confirmation for "Reset app data". Explains the
+/// consequences, then requires the owner to type `RESET` before the final
+/// (visually destructive) button enables. Pops `true` only on confirmation.
+class _ResetDataDialog extends StatefulWidget {
+  const _ResetDataDialog();
+
+  @override
+  State<_ResetDataDialog> createState() => _ResetDataDialogState();
+}
+
+class _ResetDataDialogState extends State<_ResetDataDialog> {
+  final _controller = TextEditingController();
+  static const _phrase = 'RESET';
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final canReset = _controller.text.trim() == _phrase;
+    return AlertDialog(
+      scrollable: true,
+      title: const Text('Reset app data?'),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text(
+            'This permanently deletes ALL app data for this account: customers, '
+            'imports, requests, daily adjustments, ledger, payments, meal plans, '
+            'bills and audit logs. This cannot be undone.',
+          ),
+          const SizedBox(height: 8),
+          const Text(
+            'Your account, email and password are NOT deleted — you stay signed '
+            'in and can start fresh.',
+            style: TextStyle(color: Colors.black54, fontSize: 13),
+          ),
+          const SizedBox(height: 14),
+          const Text('Type RESET to confirm:',
+              style: TextStyle(fontWeight: FontWeight.w700)),
+          const SizedBox(height: 8),
+          TextField(
+            controller: _controller,
+            autofocus: true,
+            textCapitalization: TextCapitalization.characters,
+            decoration: const InputDecoration(
+              hintText: _phrase,
+              border: OutlineInputBorder(),
+            ),
+            onChanged: (_) => setState(() {}),
+          ),
+        ],
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context, false),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          onPressed: canReset ? () => Navigator.pop(context, true) : null,
+          style: FilledButton.styleFrom(
+            backgroundColor: const Color(0xFFDC2626),
+          ),
+          child: const Text('Delete everything'),
+        ),
+      ],
     );
   }
 }

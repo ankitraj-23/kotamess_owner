@@ -1,6 +1,7 @@
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../models/audit_log.dart';
+import '../models/billing_defaults.dart';
 import '../models/chat_import.dart';
 import '../models/chat_message.dart';
 import '../models/daily_adjustment.dart';
@@ -1106,17 +1107,16 @@ class DatabaseService {
   // --- Kitchen summary ----------------------------------------------------
 
   /// Expected meal headcounts derived from active customers' active meal plans.
-  /// Returns (fromPlans, breakfast, lunch, dinner): `fromPlans` is false when
-  /// there is no plan data at all, so callers can fall back to base counts.
-  Future<({bool fromPlans, int breakfast, int lunch, int dinner})>
-      _expectedFromPlans(String ownerId) async {
+  /// Returns (fromPlans, lunch, dinner): `fromPlans` is false when there is no
+  /// plan data at all, so callers can fall back to base counts.
+  Future<({bool fromPlans, int lunch, int dinner})> _expectedFromPlans(
+      String ownerId) async {
     final rows = await _client
         .from('customer_meal_plans')
-        .select(
-            'is_active, meal_plans(breakfast_enabled,lunch_enabled,dinner_enabled), students(status)')
+        .select('is_active, meal_plans(lunch_enabled,dinner_enabled), students(status)')
         .eq('owner_id', ownerId)
         .eq('is_active', true);
-    var breakfast = 0, lunch = 0, dinner = 0;
+    var lunch = 0, dinner = 0;
     var any = false;
     for (final row in rows) {
       final student = row['students'];
@@ -1126,23 +1126,54 @@ class DatabaseService {
       final plan = row['meal_plans'];
       if (plan is! Map) continue;
       any = true;
-      if (plan['breakfast_enabled'] == true) breakfast++;
       if (plan['lunch_enabled'] == true) lunch++;
       if (plan['dinner_enabled'] == true) dinner++;
     }
-    return (fromPlans: any, breakfast: breakfast, lunch: lunch, dinner: dinner);
+    return (fromPlans: any, lunch: lunch, dinner: dinner);
   }
 
-  /// Builds the breakfast/lunch/dinner kitchen plan for [date]: expected from
-  /// active customer meal plans (fallback to base lunch/dinner counts), minus
+  /// Number of active customers for this owner — the dynamic default base count
+  /// for daily lunch/dinner (N active customers → default lunch = dinner = N,
+  /// before approved requests and manual adjustments are applied).
+  ///
+  /// "Active" follows the app's existing status logic: prefer `status`
+  /// ('active' counts; any other explicit status does not), falling back to the
+  /// legacy `active` boolean for rows with no status set.
+  Future<int> _activeCustomerCount(String ownerId) async {
+    final rows = await _client
+        .from('students')
+        .select('status, active')
+        .eq('owner_id', ownerId);
+    var count = 0;
+    for (final r in rows) {
+      final status = r['status'] as String?;
+      if (status != null && status.isNotEmpty) {
+        if (status == 'active') count++;
+      } else if (r['active'] != false) {
+        count++;
+      }
+    }
+    return count;
+  }
+
+  /// Owner-scoped "reset all my app data" for the signed-in account. Calls the
+  /// SECURITY DEFINER SQL RPC, which derives the owner from `auth.uid()` and
+  /// deletes only that owner's rows (customers, imports, requests, daily
+  /// adjustments, ledger, payments, meal plans, bills, audit logs, …) in
+  /// FK-safe order, then resets operational profile values. It never deletes
+  /// the auth user / email / password or the owner_profiles identity row.
+  Future<void> resetCurrentOwnerData() async {
+    getCurrentOwnerId(); // ensures an authenticated session (throws otherwise)
+    await _client.rpc('reset_current_owner_data');
+  }
+
+  /// Builds the lunch/dinner kitchen plan for [date]: expected from active
+  /// customer meal plans (fallback to the active-customer base count), minus
   /// confirmed cancellations, plus confirmed extras.
-  Future<KitchenSummary> fetchKitchenSummary({
-    required String date,
-    required int baseLunch,
-    required int baseDinner,
-  }) async {
+  Future<KitchenSummary> fetchKitchenSummary({required String date}) async {
     final ownerId = getCurrentOwnerId();
     final expected = await _expectedFromPlans(ownerId);
+    final base = await _activeCustomerCount(ownerId);
     final rows = await _client
         .from('meal_requests')
         .select()
@@ -1154,8 +1185,8 @@ class DatabaseService {
     return _composeKitchen(
       date: date,
       expected: expected,
-      baseLunch: baseLunch,
-      baseDinner: baseDinner,
+      baseLunch: base,
+      baseDinner: base,
       approved: approved,
     );
   }
@@ -1164,17 +1195,15 @@ class DatabaseService {
   /// dashboard can reuse one approved-request fetch across today + tomorrow.
   KitchenSummary _composeKitchen({
     required String date,
-    required ({bool fromPlans, int breakfast, int lunch, int dinner}) expected,
+    required ({bool fromPlans, int lunch, int dinner}) expected,
     required int baseLunch,
     required int baseDinner,
     required List<MealRequest> approved,
   }) {
-    final expB = expected.fromPlans ? expected.breakfast : 0;
     final expL = expected.fromPlans ? expected.lunch : baseLunch;
     final expD = expected.fromPlans ? expected.dinner : baseDinner;
 
     // Reuse the daily counting rules for cancellations/additions on this date.
-    // Breakfast is informational only (requests don't model it yet).
     final ds = DailySummary.compute(
       date: date,
       baseLunch: 0,
@@ -1185,7 +1214,6 @@ class DatabaseService {
     return KitchenSummary(
       date: date,
       fromPlans: expected.fromPlans,
-      breakfast: MealCount(expected: expB),
       lunch: MealCount(
           expected: expL, cancelled: ds.lunchCancelled, extra: ds.lunchAdded),
       dinner: MealCount(
@@ -1197,12 +1225,14 @@ class DatabaseService {
 
   /// Aggregates the Home dashboard: today's final counts, pending/approved
   /// tallies, import stats, and a merged recent-activity feed.
-  Future<DashboardSummary> fetchDashboardSummary({
-    required int baseLunch,
-    required int baseDinner,
-  }) async {
+  Future<DashboardSummary> fetchDashboardSummary() async {
     final ownerId = getCurrentOwnerId();
     final today = _dateStr(DateTime.now());
+
+    // Default base lunch/dinner = current number of active customers.
+    final base = await _activeCustomerCount(ownerId);
+    final baseLunch = base;
+    final baseDinner = base;
 
     final requestRows = await _client
         .from('meal_requests')
@@ -1322,13 +1352,11 @@ class DatabaseService {
   // --- Daily count --------------------------------------------------------
 
   /// Builds the count breakdown for [date] ('YYYY-MM-DD') from approved
-  /// requests + manual adjustments. Base counts come from the owner profile.
-  Future<DailySummary> fetchDailySummary({
-    required String date,
-    required int baseLunch,
-    required int baseDinner,
-  }) async {
+  /// requests + manual adjustments. The base lunch/dinner count defaults to the
+  /// current number of active customers.
+  Future<DailySummary> fetchDailySummary({required String date}) async {
     final ownerId = getCurrentOwnerId();
+    final base = await _activeCustomerCount(ownerId);
     final rows = await _client
         .from('meal_requests')
         .select()
@@ -1341,8 +1369,8 @@ class DatabaseService {
 
     return DailySummary.compute(
       date: date,
-      baseLunch: baseLunch,
-      baseDinner: baseDinner,
+      baseLunch: base,
+      baseDinner: base,
       approvedRequests: approved,
       adjustments: adjustments,
     );
@@ -1630,14 +1658,101 @@ class DatabaseService {
       paymentsByStudent.putIfAbsent(p.studentId, () => []).add(p);
     }
 
+    // --- Current-month billing inputs -------------------------------------
+    // Each active/paused customer carries a monthly bill (assigned plan price,
+    // else the ₹3900 default), reduced by approved meal-cancellation credits,
+    // against which the month's approved payments are applied. These are derived
+    // read-only here, so pending/rejected requests never affect the ledger.
+    final now = DateTime.now();
+    final range = _monthRange(now.month, now.year);
+    bool inMonth(String d) =>
+        d.isNotEmpty && d.compareTo(range.start) >= 0 && d.compareTo(range.next) < 0;
+
+    // Assigned active plan per customer (name + monthly/per-meal prices).
+    final planRows = await _client
+        .from('customer_meal_plans')
+        .select('student_id, meal_plans(name, monthly_price, lunch_price, dinner_price)')
+        .eq('owner_id', ownerId)
+        .eq('is_active', true)
+        .inFilter('student_id', ids);
+    final planByStudent = <String, MealPlan>{};
+    for (final r in planRows) {
+      final p = r['meal_plans'];
+      if (p is Map) {
+        planByStudent[r['student_id'] as String] =
+            MealPlan.fromJson(Map<String, dynamic>.from(p));
+      }
+    }
+
+    // Approved cancellation requests → per-customer credit for this month.
+    final cancelRows = await _client
+        .from('meal_requests')
+        .select()
+        .eq('owner_id', ownerId)
+        .eq('status', 'approved')
+        .inFilter('request_type', ['cancel_meal', 'both_meals_cancel']).inFilter(
+            'student_id', ids);
+    final creditByStudent = <String, num>{};
+    for (final r in cancelRows) {
+      final req = MealRequest.fromJson(Map<String, dynamic>.from(r));
+      final sid = req.studentId;
+      if (sid == null) continue;
+      // Anchor undated requests to when they were received.
+      final eff = DailySummary.effectiveDate(req) ?? req.createdAt;
+      if (eff == null || !inMonth(_dateStr(eff))) continue;
+      creditByStudent[sid] = (creditByStudent[sid] ?? 0) +
+          CustomerBalance.cancellationCreditOf(req, planByStudent[sid]);
+    }
+
     return [
       for (final c in customers)
-        CustomerBalance.from(
+        _composeCustomerBalance(
           c,
           entriesByStudent[c.id] ?? const [],
           paymentsByStudent[c.id] ?? const [],
+          plan: planByStudent[c.id],
+          cancellationCredit: creditByStudent[c.id] ?? 0,
+          inMonth: inMonth,
         ),
     ];
+  }
+
+  /// Builds a [CustomerBalance] carrying both the all-time totals (used by the
+  /// customer detail view) and the current-month billing summary (base bill,
+  /// cancellation credit and approved payments) the Ledger Balances view shows.
+  CustomerBalance _composeCustomerBalance(
+    Student student,
+    List<LedgerEntry> entries,
+    List<Payment> payments, {
+    required MealPlan? plan,
+    required num cancellationCredit,
+    required bool Function(String) inMonth,
+  }) {
+    final base = CustomerBalance.from(student, entries, payments);
+    // This month's approved payments: payment-type ledger rows (incl. the ones
+    // auto-created from approved WhatsApp payment notes) + recorded payments.
+    num paidThisMonth = 0;
+    for (final e in entries) {
+      if (e.entryType == 'payment' && inMonth(e.entryDate)) {
+        paidThisMonth += e.amount;
+      }
+    }
+    for (final p in payments) {
+      if (inMonth(p.paymentDate)) paidThisMonth += p.amount;
+    }
+    // A customer with an assigned plan uses its price (even ₹0 if the owner set
+    // it so); no plan falls back to the default monthly bill.
+    final baseMonthlyBill =
+        plan != null ? plan.monthlyPrice : BillingDefaults.monthlyBill;
+    return CustomerBalance(
+      student: base.student,
+      totalCharges: base.totalCharges,
+      totalPayments: base.totalPayments,
+      baseMonthlyBill: baseMonthlyBill,
+      cancellationCredit: cancellationCredit,
+      paidThisMonth: paidThisMonth,
+      planName: plan?.name ?? '',
+    );
   }
 
   // --- Monthly bills ------------------------------------------------------
@@ -1751,6 +1866,10 @@ class DatabaseService {
       baseByStudent[r['student_id'] as String] =
           plan is Map ? (plan['monthly_price'] as num? ?? 0) : 0;
     }
+    // Customers with no assigned plan still bill the default monthly amount,
+    // so monthly-bill generation never produces a ₹0 base for an active student.
+    num baseFor(String studentId) =>
+        baseByStudent[studentId] ?? BillingDefaults.monthlyBill;
 
     final ledgerRows = await _client
         .from('ledger_entries')
@@ -1798,7 +1917,7 @@ class DatabaseService {
           studentPhone: c.phone,
           month: month,
           year: year,
-          baseAmount: baseByStudent[c.id] ?? 0,
+          baseAmount: baseFor(c.id),
           monthEntries: entriesByStudent[c.id] ?? const [],
           monthPayments: paymentsByStudent[c.id] ?? const [],
         ),

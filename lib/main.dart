@@ -155,6 +155,10 @@ class _KotaShellState extends State<KotaShell> {
   late OwnerProfile _profile = widget.profile;
   int _index = 0;
 
+  /// Bumped after "Reset app data" so the (always-mounted) Import screen clears
+  /// its local draft via didUpdateWidget.
+  int _resetToken = 0;
+
   /// Switch tabs and refresh the target screen so figures stay current after
   /// imports/approvals on other tabs.
   void _select(int index) {
@@ -188,6 +192,21 @@ class _KotaShellState extends State<KotaShell> {
     _select(_tabRequests);
   }
 
+  /// After the owner resets all app data: bump the reset token (clears the
+  /// mounted Import tab's local draft), refresh every data tab so they refetch
+  /// the now-empty account, and land back on Home. Auth/session is untouched.
+  void _onDataReset() {
+    setState(() {
+      _resetToken++;
+      _index = _tabHome;
+    });
+    _homeKey.currentState?.reload();
+    _customersKey.currentState?.reload();
+    _requestsKey.currentState?.reload();
+    _dailyKey.currentState?.reload();
+    _ledgerKey.currentState?.reload();
+  }
+
   Future<void> _openSettings() async {
     await Navigator.of(context).push(
       MaterialPageRoute(
@@ -199,6 +218,7 @@ class _KotaShellState extends State<KotaShell> {
           // change, so just push the new profile into the shell.
           onProfileUpdated: (updated) => setState(() => _profile = updated),
           onSignOut: widget.onSignOut,
+          onDataReset: _onDataReset,
         ),
       ),
     );
@@ -222,6 +242,7 @@ class _KotaShellState extends State<KotaShell> {
         extractionService: _extractionService,
         databaseService: _databaseService,
         onSavedGoToRequests: _onImportSaved,
+        resetToken: _resetToken,
       ),
       MealRequestsScreen(key: _requestsKey, databaseService: _databaseService),
       DailyScreen(

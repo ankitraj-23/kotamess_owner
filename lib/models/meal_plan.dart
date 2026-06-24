@@ -3,11 +3,9 @@
 class MealPlan {
   final String id;
   final String name;
-  final bool breakfastEnabled;
   final bool lunchEnabled;
   final bool dinnerEnabled;
   final num monthlyPrice;
-  final num breakfastPrice;
   final num lunchPrice;
   final num dinnerPrice;
   final bool isActive;
@@ -16,11 +14,9 @@ class MealPlan {
   const MealPlan({
     required this.id,
     required this.name,
-    this.breakfastEnabled = false,
     this.lunchEnabled = false,
     this.dinnerEnabled = false,
     this.monthlyPrice = 0,
-    this.breakfastPrice = 0,
     this.lunchPrice = 0,
     this.dinnerPrice = 0,
     this.isActive = true,
@@ -30,11 +26,9 @@ class MealPlan {
   factory MealPlan.fromJson(Map<String, dynamic> json) => MealPlan(
         id: json['id'] as String,
         name: json['name'] as String? ?? '',
-        breakfastEnabled: json['breakfast_enabled'] as bool? ?? false,
         lunchEnabled: json['lunch_enabled'] as bool? ?? false,
         dinnerEnabled: json['dinner_enabled'] as bool? ?? false,
         monthlyPrice: (json['monthly_price'] as num?) ?? 0,
-        breakfastPrice: (json['breakfast_price'] as num?) ?? 0,
         lunchPrice: (json['lunch_price'] as num?) ?? 0,
         dinnerPrice: (json['dinner_price'] as num?) ?? 0,
         isActive: json['is_active'] as bool? ?? true,
@@ -45,11 +39,9 @@ class MealPlan {
   /// set by the DB or service).
   Map<String, dynamic> toWritable() => {
         'name': name.trim(),
-        'breakfast_enabled': breakfastEnabled,
         'lunch_enabled': lunchEnabled,
         'dinner_enabled': dinnerEnabled,
         'monthly_price': monthlyPrice,
-        'breakfast_price': breakfastPrice,
         'lunch_price': lunchPrice,
         'dinner_price': dinnerPrice,
         'is_active': isActive,
@@ -57,11 +49,9 @@ class MealPlan {
 
   MealPlan copyWith({
     String? name,
-    bool? breakfastEnabled,
     bool? lunchEnabled,
     bool? dinnerEnabled,
     num? monthlyPrice,
-    num? breakfastPrice,
     num? lunchPrice,
     num? dinnerPrice,
     bool? isActive,
@@ -69,11 +59,9 @@ class MealPlan {
     return MealPlan(
       id: id,
       name: name ?? this.name,
-      breakfastEnabled: breakfastEnabled ?? this.breakfastEnabled,
       lunchEnabled: lunchEnabled ?? this.lunchEnabled,
       dinnerEnabled: dinnerEnabled ?? this.dinnerEnabled,
       monthlyPrice: monthlyPrice ?? this.monthlyPrice,
-      breakfastPrice: breakfastPrice ?? this.breakfastPrice,
       lunchPrice: lunchPrice ?? this.lunchPrice,
       dinnerPrice: dinnerPrice ?? this.dinnerPrice,
       isActive: isActive ?? this.isActive,
@@ -81,10 +69,9 @@ class MealPlan {
     );
   }
 
-  /// Short "B · L · D" style summary of the meals this plan includes.
+  /// Short "L · D" style summary of the meals this plan includes.
   String get mealsSummary {
     final parts = <String>[
-      if (breakfastEnabled) 'Breakfast',
       if (lunchEnabled) 'Lunch',
       if (dinnerEnabled) 'Dinner',
     ];

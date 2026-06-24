@@ -95,14 +95,28 @@ class LedgerScreenState extends State<LedgerScreen> {
       return;
     }
     final rows = <List<Object?>>[
-      ['customer_name', 'phone', 'total_charges', 'total_payments', 'balance'],
+      [
+        'customer_name',
+        'phone',
+        'plan',
+        'base_monthly_bill',
+        'cancellation_credit',
+        'adjusted_bill',
+        'paid',
+        'remaining',
+        'status',
+      ],
       for (final b in _balances)
         [
           b.student.name,
           b.student.phone,
-          formatMoney(b.totalCharges),
-          formatMoney(b.totalPayments),
-          formatMoney(b.balance),
+          b.planName,
+          formatMoney(b.baseMonthlyBill),
+          formatMoney(b.cancellationCredit),
+          formatMoney(b.adjustedBill),
+          formatMoney(b.paidThisMonth),
+          formatMoney(b.remaining),
+          b.billStatusLabel,
         ],
     ];
     await Clipboard.setData(ClipboardData(text: rowsToCsv(rows)));
@@ -480,42 +494,63 @@ class _BalanceTile extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final settled = balance.balance == 0;
-    final color = settled
-        ? const Color(0xFF2563EB)
-        : balance.owes
-            ? const Color(0xFFDC2626)
-            : const Color(0xFF16A34A);
-    final trailing = settled
-        ? 'Settled'
-        : balance.owes
-            ? '₹${formatMoney(balance.balance)} due'
-            : '₹${formatMoney(balance.balance.abs())} cr';
+    final status = balance.billStatus;
+    final color = switch (status) {
+      'pending' => const Color(0xFFDC2626),
+      'partial' => const Color(0xFFD97706),
+      _ => const Color(0xFF16A34A),
+    };
     final name = balance.student.name;
+    final hasCredit = balance.cancellationCredit > 0;
     return Card(
       margin: const EdgeInsets.only(bottom: 10),
       child: ListTile(
         onTap: onTap,
+        isThreeLine: true,
         leading: CircleAvatar(
           child: Text(name.isEmpty ? '?' : name[0].toUpperCase()),
         ),
         title: Text(name,
             style: const TextStyle(fontWeight: FontWeight.w800)),
-        subtitle: Text(
-          [
-            if (balance.student.phone.isNotEmpty) balance.student.phone,
-            'Charges ₹${formatMoney(balance.totalCharges)}',
-            'Paid ₹${formatMoney(balance.totalPayments)}',
-          ].join(' · '),
-          maxLines: 1,
-          overflow: TextOverflow.ellipsis,
+        subtitle: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const SizedBox(height: 2),
+            Text(
+              [
+                if (balance.planName.isNotEmpty)
+                  balance.planName
+                else if (balance.student.phone.isNotEmpty)
+                  balance.student.phone,
+                'Bill ₹${formatMoney(balance.baseMonthlyBill)}',
+                if (hasCredit)
+                  'Credit ₹${formatMoney(balance.cancellationCredit)}',
+                if (hasCredit)
+                  'Adjusted ₹${formatMoney(balance.adjustedBill)}',
+              ].join(' · '),
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+            ),
+            Text(
+              'Paid ₹${formatMoney(balance.paidThisMonth)}',
+              style: TextStyle(color: Colors.grey.shade600, fontSize: 12),
+            ),
+          ],
         ),
         trailing: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           crossAxisAlignment: CrossAxisAlignment.end,
           children: [
-            Text(trailing,
-                style: TextStyle(fontWeight: FontWeight.w800, color: color)),
+            Text(
+              balance.remaining > 0
+                  ? '₹${formatMoney(balance.remaining)} due'
+                  : balance.billStatusLabel,
+              style: TextStyle(fontWeight: FontWeight.w800, color: color),
+            ),
+            Padding(
+              padding: const EdgeInsets.only(top: 2),
+              child: InfoPill(balance.billStatusLabel, color: color),
+            ),
             if (balance.student.status == 'paused')
               const Padding(
                 padding: EdgeInsets.only(top: 2),

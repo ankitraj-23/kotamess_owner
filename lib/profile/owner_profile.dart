@@ -6,11 +6,8 @@ class OwnerProfile {
   final String messName;
   final String phone;
   final int retentionDays;
-  final int defaultLunchCount;
-  final int defaultDinnerCount;
 
   /// Daily meal serving times, stored as `'HH:mm'`.
-  final String breakfastTime;
   final String lunchTime;
   final String dinnerTime;
 
@@ -28,9 +25,6 @@ class OwnerProfile {
     required this.messName,
     required this.phone,
     required this.retentionDays,
-    this.defaultLunchCount = 0,
-    this.defaultDinnerCount = 0,
-    this.breakfastTime = '08:00',
     this.lunchTime = '13:00',
     this.dinnerTime = '20:00',
     this.requestCutoffMinutes = 60,
@@ -53,9 +47,6 @@ class OwnerProfile {
       messName: json['mess_name'] as String? ?? '',
       phone: json['phone'] as String? ?? '',
       retentionDays: (json['retention_days'] as num?)?.toInt() ?? 90,
-      defaultLunchCount: (json['default_lunch_count'] as num?)?.toInt() ?? 0,
-      defaultDinnerCount: (json['default_dinner_count'] as num?)?.toInt() ?? 0,
-      breakfastTime: _time(json['breakfast_time'], '08:00'),
       lunchTime: _time(json['lunch_time'], '13:00'),
       dinnerTime: _time(json['dinner_time'], '20:00'),
       requestCutoffMinutes:
@@ -74,8 +65,6 @@ class OwnerProfile {
       'mess_name': messName,
       'phone': phone,
       'retention_days': retentionDays,
-      'default_lunch_count': defaultLunchCount,
-      'default_dinner_count': defaultDinnerCount,
     };
   }
 
@@ -86,9 +75,6 @@ class OwnerProfile {
       'mess_name': messName,
       'phone': phone,
       'retention_days': retentionDays,
-      'default_lunch_count': defaultLunchCount,
-      'default_dinner_count': defaultDinnerCount,
-      'breakfast_time': breakfastTime,
       'lunch_time': lunchTime,
       'dinner_time': dinnerTime,
       'request_cutoff_minutes': requestCutoffMinutes,
@@ -100,9 +86,6 @@ class OwnerProfile {
     String? messName,
     String? phone,
     int? retentionDays,
-    int? defaultLunchCount,
-    int? defaultDinnerCount,
-    String? breakfastTime,
     String? lunchTime,
     String? dinnerTime,
     int? requestCutoffMinutes,
@@ -114,9 +97,6 @@ class OwnerProfile {
       messName: messName ?? this.messName,
       phone: phone ?? this.phone,
       retentionDays: retentionDays ?? this.retentionDays,
-      defaultLunchCount: defaultLunchCount ?? this.defaultLunchCount,
-      defaultDinnerCount: defaultDinnerCount ?? this.defaultDinnerCount,
-      breakfastTime: breakfastTime ?? this.breakfastTime,
       lunchTime: lunchTime ?? this.lunchTime,
       dinnerTime: dinnerTime ?? this.dinnerTime,
       requestCutoffMinutes: requestCutoffMinutes ?? this.requestCutoffMinutes,

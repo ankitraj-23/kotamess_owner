@@ -51,27 +51,12 @@ class HomeScreenState extends State<HomeScreen> {
     reload();
   }
 
-  @override
-  void didUpdateWidget(HomeScreen oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    // Base counts changed in Settings: refresh today's totals.
-    if (oldWidget.profile.defaultLunchCount !=
-            widget.profile.defaultLunchCount ||
-        oldWidget.profile.defaultDinnerCount !=
-            widget.profile.defaultDinnerCount) {
-      reload();
-    }
-  }
-
   /// Public so the shell can refresh after imports/approvals.
   Future<void> reload() async {
     if (mounted) setState(() => _error = null);
     try {
       final clearedAt = await _recentActivityPrefs.clearedAt(widget.profile.id);
-      final summary = await widget.databaseService.fetchDashboardSummary(
-        baseLunch: widget.profile.defaultLunchCount,
-        baseDinner: widget.profile.defaultDinnerCount,
-      );
+      final summary = await widget.databaseService.fetchDashboardSummary();
       if (!mounted) return;
       setState(() {
         _summary = summary;
@@ -239,8 +224,8 @@ class _Greeting extends StatelessWidget {
   }
 }
 
-/// Today's / tomorrow's "how much to cook" card: breakfast, lunch and dinner
-/// each shown as expected − cancelled + extra = final.
+/// Today's / tomorrow's "how much to cook" card: lunch and dinner each shown
+/// as expected − cancelled + extra = final.
 class _KitchenCard extends StatelessWidget {
   const _KitchenCard({required this.title, required this.summary});
   final String title;
@@ -253,13 +238,6 @@ class _KitchenCard extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          _MealLine(
-            label: 'Breakfast',
-            icon: Icons.bakery_dining,
-            color: const Color(0xFFCA8A04),
-            count: summary.breakfast,
-          ),
-          const Divider(height: 18),
           _MealLine(
             label: 'Lunch',
             icon: Icons.lunch_dining,
@@ -277,8 +255,8 @@ class _KitchenCard extends StatelessWidget {
           Text(
             summary.fromPlans
                 ? 'Expected from active customer meal plans.'
-                : 'Expected from base counts (Settings). Assign meal plans for '
-                    'per-customer accuracy.',
+                : 'Expected from your active customer count. Assign meal plans '
+                    'for per-customer accuracy.',
             style: TextStyle(color: Colors.grey.shade500, fontSize: 11),
           ),
         ],

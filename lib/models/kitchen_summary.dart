@@ -17,7 +17,7 @@ class MealCount {
   }
 }
 
-/// Per-day kitchen plan covering breakfast, lunch and dinner. Built by
+/// Per-day kitchen plan covering lunch and dinner. Built by
 /// [DatabaseService.fetchKitchenSummary] from active customer meal plans (when
 /// present) plus confirmed cancellation/addition requests, falling back to the
 /// owner's base lunch/dinner counts when no plan data exists.
@@ -28,21 +28,18 @@ class KitchenSummary {
   /// false means the figures fell back to the owner's base counts.
   final bool fromPlans;
 
-  final MealCount breakfast;
   final MealCount lunch;
   final MealCount dinner;
 
   const KitchenSummary({
     required this.date,
     required this.fromPlans,
-    required this.breakfast,
     required this.lunch,
     required this.dinner,
   });
 
   const KitchenSummary.empty(this.date)
       : fromPlans = false,
-        breakfast = const MealCount(),
         lunch = const MealCount(),
         dinner = const MealCount();
 }

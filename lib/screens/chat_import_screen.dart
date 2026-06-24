@@ -15,11 +15,18 @@ class ChatImportScreen extends StatefulWidget {
     required this.extractionService,
     required this.databaseService,
     required this.onSavedGoToRequests,
+    this.resetToken = 0,
   });
 
   final ExtractionService extractionService;
   final DatabaseService databaseService;
   final VoidCallback onSavedGoToRequests;
+
+  /// Bumped by the app shell whenever the owner resets all app data. A change
+  /// here clears this screen's local draft (pasted/imported text, picked file,
+  /// last import summary/error) so a reset leaves the Import tab fresh even
+  /// though it stays mounted in the bottom-tab shell.
+  final int resetToken;
 
   @override
   State<ChatImportScreen> createState() => _ChatImportScreenState();
@@ -33,6 +40,16 @@ class _ChatImportScreenState extends State<ChatImportScreen> {
   bool _busy = false;
   ImportSummary? _summary;
   String? _error;
+
+  @override
+  void didUpdateWidget(ChatImportScreen oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // Owner reset all app data: wipe the local import draft so the tab matches
+    // the now-empty account instead of showing stale text/summary.
+    if (widget.resetToken != oldWidget.resetToken) {
+      _clear();
+    }
+  }
 
   @override
   void dispose() {
@@ -276,11 +293,14 @@ class _SummaryCard extends StatelessWidget {
                     ?.copyWith(fontWeight: FontWeight.w800),
               ),
               const SizedBox(height: 6),
-              _SummaryRow('Join names found', summary.rosterFound),
-              _SummaryRow('New students created', summary.rosterCreated,
-                  emphasize: true),
+              _SummaryRow('Roster names found', summary.rosterFound),
               _SummaryRow('Existing students matched', summary.rosterMatched),
-              _SummaryRow('Ambiguous / skipped', summary.rosterAmbiguous),
+              // Roster auto-create is disabled, so the server reports 0 created.
+              // Only surface this row if a real, nonzero count comes back.
+              if (summary.rosterCreated > 0)
+                _SummaryRow('New students created', summary.rosterCreated,
+                    emphasize: true),
+              _SummaryRow('Skipped / needs review', summary.rosterAmbiguous),
             ],
           ],
         ),
