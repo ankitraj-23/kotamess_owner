@@ -15,6 +15,7 @@ import '../models/payment.dart';
 import '../models/student.dart';
 import 'money_utils.dart';
 import 'name_utils.dart';
+import 'student_roster_import_service.dart';
 
 /// Thrown when an unresolved-sender request is asked to transition into an
 /// approved/confirmed/completed state. The message is owner-facing and safe to
@@ -821,6 +822,165 @@ class DatabaseService {
     return rows
         .map((e) => MealRequest.fromJson(Map<String, dynamic>.from(e)))
         .toList();
+  }
+
+  // --- Roster import (CSV) ------------------------------------------------
+
+  /// Parses [csvContent] and imports the roster in one call. See
+  /// [importStudentRoster] for the matching rules.
+  Future<RosterImportResult> importRosterCsv(String csvContent) async {
+    final parsed = StudentRosterImport.parse(csvContent);
+    return importStudentRoster(parsed.rows, seedIssues: parsed.issues);
+  }
+
+  /// Inserts/updates customers from a parsed roster, into the existing
+  /// `students` table. Returns created/updated counts plus skipped/ambiguous
+  /// rows for owner review. Never deletes anyone.
+  ///
+  /// Matching (deliberately conservative — same spirit as the WhatsApp sender
+  /// matching, which is left untouched):
+  ///   * Phone (normalized 10-digit) is the strong identifier. A unique phone
+  ///     match updates that customer; multiple matches are reported ambiguous.
+  ///   * With no phone match, a phone-bearing row only enriches a pre-existing
+  ///     active customer of the same name when that customer has NO phone yet;
+  ///     otherwise it is treated as a distinct person and created. This keeps
+  ///     two "Rahul Kumar" rows with different phones as two separate students.
+  ///   * With no phone at all, a row updates a single pre-existing active
+  ///     same-name customer; if several already share that name it is left
+  ///     ambiguous (never merged). Two same-name no-phone rows in one file do
+  ///     NOT collapse into one — the second is reported ambiguous, not merged.
+  Future<RosterImportResult> importStudentRoster(
+    List<RosterImportRow> rows, {
+    List<RosterImportIssue> seedIssues = const [],
+  }) async {
+    final ownerId = getCurrentOwnerId();
+    final issues = <RosterImportIssue>[...seedIssues];
+    var created = 0;
+    var updated = 0;
+
+    // Snapshot existing customers + aliases once, then keep this in-memory view
+    // in sync as we create/update so duplicate-name detection stays correct
+    // within a single run.
+    final studentRows =
+        await _client.from('students').select().eq('owner_id', ownerId);
+    final students = studentRows
+        .map((e) => Student.fromJson(Map<String, dynamic>.from(e)))
+        .toList();
+
+    final aliasRows = await _client
+        .from('student_aliases')
+        .select('student_id, normalized_alias')
+        .eq('owner_id', ownerId);
+    final aliasOwner = <String, String>{}; // normalized_alias -> student_id
+    for (final a in aliasRows) {
+      final key = a['normalized_alias'] as String? ?? '';
+      final sid = a['student_id'] as String?;
+      if (key.isNotEmpty && sid != null) aliasOwner[key] = sid;
+    }
+
+    // Students created during THIS run, so name matching can tell a row apart
+    // from a customer we just inserted (and so never merges duplicate-name rows
+    // from the same file).
+    final createdThisRun = <String>{};
+
+    // Adds an alias unless it would collide with another student's identity.
+    // Adding a generic alias ("Rahul") that several students share would wrongly
+    // auto-link future WhatsApp messages — this preserves that ambiguity guard.
+    Future<void> tryAddAlias(String studentId, String alias) async {
+      final key = NameUtils.normalize(alias);
+      if (key.isEmpty) return;
+      final owner = aliasOwner[key];
+      if (owner != null && owner != studentId) return;
+      final nameClash = students.any(
+          (s) => s.id != studentId && NameUtils.normalize(s.name) == key);
+      if (nameClash) return;
+      await addAlias(studentId: studentId, alias: alias);
+      aliasOwner[key] = studentId;
+    }
+
+    Future<void> applyUpdate(Student existing, RosterImportRow row) async {
+      final update = <String, dynamic>{'name': row.name};
+      // Never overwrite an existing phone with an empty value.
+      if (row.phone.isNotEmpty) update['phone'] = row.phone;
+      if (row.statusExplicit) {
+        update['status'] = row.status;
+        update['active'] = row.status == 'active';
+      }
+      if (row.monthlyAmount != null) update['monthly_plan'] = row.monthlyAmount;
+      await _client
+          .from('students')
+          .update(update)
+          .eq('id', existing.id)
+          .eq('owner_id', ownerId);
+      final i = students.indexWhere((s) => s.id == existing.id);
+      if (i >= 0) {
+        students[i] = students[i].copyWith(
+          name: row.name,
+          phone: row.phone.isNotEmpty ? row.phone : null,
+          status: row.statusExplicit ? row.status : null,
+          monthlyPlan: row.monthlyAmount,
+        );
+      }
+      for (final a in row.aliases) {
+        await tryAddAlias(existing.id, a);
+      }
+    }
+
+    Future<void> createRow(RosterImportRow row) async {
+      final inserted = await _client
+          .from('students')
+          .insert({
+            'owner_id': ownerId,
+            'name': row.name,
+            'phone': row.phone,
+            'status': row.status,
+            'active': row.status == 'active',
+            'monthly_plan': row.monthlyAmount ?? 0,
+            'joined_at': _dateStr(DateTime.now()),
+          })
+          .select()
+          .single();
+      final s = Student.fromJson(Map<String, dynamic>.from(inserted));
+      students.add(s);
+      createdThisRun.add(s.id);
+      for (final a in row.aliases) {
+        await tryAddAlias(s.id, a);
+      }
+    }
+
+    for (final row in rows) {
+      // Build the candidate view from the live snapshot, then let the pure
+      // matcher decide. All the same-name ambiguity protection lives there.
+      final snapshot = [
+        for (final s in students)
+          RosterCandidate(
+            id: s.id,
+            normalizedName: NameUtils.normalize(s.name),
+            normalizedPhone: StudentRosterImport.normalizePhone(s.phone),
+            isActive: s.isActive,
+            createdThisRun: createdThisRun.contains(s.id),
+          ),
+      ];
+      final decision = StudentRosterImport.decide(row, snapshot);
+      switch (decision.action) {
+        case RosterAction.update:
+          final target = students.firstWhere((s) => s.id == decision.targetId);
+          await applyUpdate(target, row);
+          updated++;
+        case RosterAction.create:
+          await createRow(row);
+          created++;
+        case RosterAction.ambiguous:
+          issues.add(RosterImportIssue(
+            lineNumber: row.lineNumber,
+            name: row.name,
+            kind: RosterIssueKind.ambiguous,
+            reason: decision.reason ?? 'Needs manual review',
+          ));
+      }
+    }
+
+    return RosterImportResult(created: created, updated: updated, issues: issues);
   }
 
   // --- Meal plans ---------------------------------------------------------

@@ -1,7 +1,11 @@
+import 'dart:convert';
+
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 
 import '../models/student.dart';
 import '../services/database_service.dart';
+import '../services/student_roster_import_service.dart';
 import '../widgets/common.dart';
 import 'customer_detail_screen.dart';
 
@@ -21,6 +25,7 @@ class CustomersScreenState extends State<CustomersScreen> {
 
   String _filter = 'all'; // all | active | paused | inactive
   bool _loading = true;
+  bool _importing = false;
   String? _error;
   List<Student> _items = [];
 
@@ -77,6 +82,98 @@ class CustomersScreenState extends State<CustomersScreen> {
       _toast('Customer added.');
       await reload();
     }
+  }
+
+  /// Lets the owner pick a CSV roster export, imports it, then shows a summary
+  /// and refreshes the list. Existing customers are updated and new ones added;
+  /// nobody is deleted (see [DatabaseService.importStudentRoster]).
+  Future<void> _importCsv() async {
+    final FilePickerResult? picked;
+    try {
+      picked = await FilePicker.platform.pickFiles(
+        type: FileType.custom,
+        allowedExtensions: ['csv'],
+        withData: true,
+      );
+    } catch (_) {
+      _toast('Could not open the file picker.');
+      return;
+    }
+    if (picked == null || picked.files.isEmpty) return; // cancelled
+
+    final file = picked.files.single;
+    final bytes = file.bytes;
+    if (bytes == null) {
+      _toast('Could not read the selected file.');
+      return;
+    }
+
+    setState(() => _importing = true);
+    try {
+      // Excel CSV exports are UTF-8 (allowMalformed tolerates a stray BOM/byte).
+      final content = utf8.decode(bytes, allowMalformed: true);
+      final result = await widget.databaseService.importRosterCsv(content);
+      if (!mounted) return;
+      await reload();
+      if (!mounted) return;
+      await _showImportSummary(result);
+    } on FormatException catch (e) {
+      _toast(e.message);
+    } catch (_) {
+      _toast('Import failed. Check the file and try again.');
+    } finally {
+      if (mounted) setState(() => _importing = false);
+    }
+  }
+
+  Future<void> _showImportSummary(RosterImportResult result) {
+    return showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Import complete'),
+        content: SizedBox(
+          width: double.maxFinite,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text('Created: ${result.created}'),
+              Text('Updated: ${result.updated}'),
+              Text('Skipped: ${result.skipped}'),
+              Text('Ambiguous (needs review): ${result.ambiguous}'),
+              if (result.issues.isNotEmpty) ...[
+                const SizedBox(height: 12),
+                const Text('Rows needing attention:',
+                    style: TextStyle(fontWeight: FontWeight.w700)),
+                const SizedBox(height: 6),
+                Flexible(
+                  child: ListView(
+                    shrinkWrap: true,
+                    children: [
+                      for (final i in result.issues)
+                        Padding(
+                          padding: const EdgeInsets.only(bottom: 6),
+                          child: Text(
+                            'Line ${i.lineNumber}'
+                            '${i.name.isEmpty ? '' : ' (${i.name})'}: ${i.reason}',
+                            style: const TextStyle(fontSize: 13),
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+              ],
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('Done'),
+          ),
+        ],
+      ),
+    );
   }
 
   Future<void> _edit(Student customer) async {
@@ -140,6 +237,18 @@ class CustomersScreenState extends State<CustomersScreen> {
                             .headlineSmall
                             ?.copyWith(fontWeight: FontWeight.w800)),
                   ),
+                  OutlinedButton.icon(
+                    onPressed: _importing ? null : _importCsv,
+                    icon: _importing
+                        ? const SizedBox(
+                            width: 16,
+                            height: 16,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.upload_file, size: 18),
+                    label: const Text('Import CSV'),
+                  ),
+                  const SizedBox(width: 8),
                   FilledButton.icon(
                     onPressed: _add,
                     icon: const Icon(Icons.person_add_alt_1, size: 18),
