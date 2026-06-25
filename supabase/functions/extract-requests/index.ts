@@ -31,6 +31,7 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient, SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { isGroupSystemLine, parseRosterEvents } from "./roster_parser.ts";
+import { messageFingerprint, parseTimestamp } from "./fingerprint.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -218,7 +219,7 @@ serve(async (req: Request): Promise<Response> => {
     logTiming("parse_whatsapp", Date.now() - tParse, { count: parsed.length });
     const cutoffMs = Date.parse(today + "T00:00:00Z") - RETENTION_DAYS * 86_400_000;
 
-    const processed: ChatMessage[] = [];
+    const inWindow: ChatMessage[] = [];
     let skippedOld = 0;
     for (const m of parsed) {
       const ts = parseTimestamp(m.dateText);
@@ -226,8 +227,51 @@ serve(async (req: Request): Promise<Response> => {
         skippedOld++; // old message with a real timestamp — outside the window
         continue;
       }
-      processed.push(m);
+      inWindow.push(m);
     }
+
+    // --- Idempotency: skip already-imported messages by fingerprint -----
+    // Re-importing the SAME WhatsApp export (e.g. Priya uploads the full chat
+    // again) must NOT recreate requests the owner already accepted/rejected.
+    // We fingerprint every in-window message (owner + normalized sender +
+    // timestamp + text — robust to re-export whitespace/am-pm quirks), batch-
+    // check which fingerprints this owner has already seen, and DROP the known
+    // ones BEFORE Gemini/fallback extraction so old messages neither recreate
+    // requests nor cost extraction. This is independent of request status — a
+    // re-imported message is skipped whether its request was approved, rejected
+    // or still pending. The fingerprint registry rows are written at the END,
+    // only after the requests are created (see whatsapp_message_fingerprints),
+    // so a mid-import failure never silently swallows a message on retry.
+    const tFp = Date.now();
+    const inWindowFps = await Promise.all(
+      inWindow.map((m) => messageFingerprint(ownerId, cleanSender(m.sender), m.dateText, m.text)),
+    );
+    // Collapse messages that are identical within THIS export (first wins), so a
+    // single import never tries to register the same fingerprint twice.
+    const seenInBatch = new Set<string>();
+    const distinctMessages: ChatMessage[] = [];
+    const distinctFps: string[] = [];
+    for (let i = 0; i < inWindow.length; i++) {
+      const fp = inWindowFps[i];
+      if (seenInBatch.has(fp)) continue;
+      seenInBatch.add(fp);
+      distinctMessages.push(inWindow[i]);
+      distinctFps.push(fp);
+    }
+    const knownFps = await loadExistingFingerprints(supabase, ownerId, distinctFps);
+    const processed: ChatMessage[] = [];
+    const processedFps: string[] = [];
+    for (let i = 0; i < distinctMessages.length; i++) {
+      if (knownFps.has(distinctFps[i])) continue; // already imported before — skip
+      processed.push(distinctMessages[i]);
+      processedFps.push(distinctFps[i]);
+    }
+    logTiming("fingerprint_dedup", Date.now() - tFp, {
+      inWindow: inWindow.length,
+      distinct: distinctMessages.length,
+      fresh: processed.length,
+      skippedDuplicates: inWindow.length - processed.length,
+    });
 
     const totalMessages = parsed.length;
     const processedMessages = processed.length;
@@ -418,6 +462,33 @@ serve(async (req: Request): Promise<Response> => {
         if (dupErr) throw dupErr;
         duplicateCount = dupRows.length;
       }
+    }
+
+    // --- Register fingerprints for the messages we just imported -------
+    // Done LAST, after the requests exist, so a failure earlier in the pipeline
+    // never marks a message as "seen" without its request being created (a retry
+    // would otherwise skip it forever). Best-effort + ignore-duplicates: the
+    // unique (owner_id, message_fingerprint) key makes this safe under a re-run
+    // or a concurrent import, and a registry hiccup shouldn't fail an otherwise
+    // successful import (the worst case is one message re-offered next import).
+    if (processedFps.length > 0) {
+      const tReg = Date.now();
+      const fpRows = processed.map((m, i) => ({
+        owner_id: ownerId,
+        message_fingerprint: processedFps[i],
+        chat_message_id: messageIdByText.get(m.text) ?? null,
+      }));
+      try {
+        const { error: fpErr } = await supabase
+          .from("whatsapp_message_fingerprints")
+          .upsert(fpRows, { onConflict: "owner_id,message_fingerprint", ignoreDuplicates: true });
+        if (fpErr) throw fpErr;
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        console.error("[extract-requests] fingerprint registry write failed.", JSON.stringify({ count: fpRows.length, error: msg }));
+        warnings.push("Could not record import fingerprints; a re-import may re-offer these messages.");
+      }
+      logTiming("fingerprint_register", Date.now() - tReg, { count: fpRows.length });
     }
 
     // --- Counts + final status -----------------------------------------
@@ -1011,6 +1082,34 @@ async function loadExistingDupKeys(
 }
 
 // ---------------------------------------------------------------------------
+// WhatsApp message fingerprints (import idempotency)
+// ---------------------------------------------------------------------------
+// Which of the supplied fingerprints this owner has already imported. Batched
+// in chunks so a big export is a handful of `in (...)` queries, not one per
+// message, and so we never blow the PostgREST URL length limit. RLS already
+// scopes to the owner; the explicit owner_id filter keeps the index lookup tight.
+async function loadExistingFingerprints(
+  supabase: SupabaseClient,
+  ownerId: string,
+  fingerprints: string[],
+): Promise<Set<string>> {
+  const found = new Set<string>();
+  const CHUNK = 200;
+  for (let i = 0; i < fingerprints.length; i += CHUNK) {
+    const slice = fingerprints.slice(i, i + CHUNK);
+    if (slice.length === 0) continue;
+    const { data, error } = await supabase
+      .from("whatsapp_message_fingerprints")
+      .select("message_fingerprint")
+      .eq("owner_id", ownerId)
+      .in("message_fingerprint", slice);
+    if (error) throw error;
+    for (const r of data ?? []) found.add(r.message_fingerprint as string);
+  }
+  return found;
+}
+
+// ---------------------------------------------------------------------------
 // Candidate filtering + batched Gemini extraction
 // ---------------------------------------------------------------------------
 // A WhatsApp export is mostly chatter. Sending all of it to Gemini is slow and
@@ -1386,50 +1485,6 @@ function parseLine(line: string): ChatMessage | null {
   if (m) return { dateText: "", sender: m[1].trim(), text: m[2].trim() };
 
   return null;
-}
-
-// Parse a WhatsApp header date/time into a Date (UTC), tolerant of formats.
-// Indian exports are day-first: 12/06/26 or 12/06/2026, with 12h or 24h time.
-// Returns null when there is no usable timestamp.
-function parseTimestamp(dateText: string): Date | null {
-  if (!dateText || dateText.trim() === "") return null;
-  const cleaned = dateText.replace(/[‎‏]/g, "").trim();
-
-  const dm = cleaned.match(/(\d{1,2})[\/.\-](\d{1,2})[\/.\-](\d{2,4})/);
-  if (!dm) return null;
-  let day = parseInt(dm[1], 10);
-  let month = parseInt(dm[2], 10);
-  let year = parseInt(dm[3], 10);
-  if (year < 100) year += 2000;
-  // If clearly month-first (day field > 12 but month field <= 12 is the common
-  // case already handled); swap only when the first field can't be a month.
-  if (month > 12 && day <= 12) {
-    const t = month;
-    month = day;
-    day = t;
-  }
-  if (month < 1 || month > 12 || day < 1 || day > 31) return null;
-
-  let hour = 0;
-  let minute = 0;
-  let second = 0;
-  const tm = cleaned.match(/(\d{1,2}):(\d{2})(?::(\d{2}))?\s*([ap])\.?m?\.?/i);
-  if (tm) {
-    hour = parseInt(tm[1], 10) % 12;
-    minute = parseInt(tm[2], 10);
-    second = tm[3] ? parseInt(tm[3], 10) : 0;
-    if (/p/i.test(tm[4])) hour += 12;
-  } else {
-    const t24 = cleaned.match(/(\d{1,2}):(\d{2})(?::(\d{2}))?/);
-    if (t24) {
-      hour = parseInt(t24[1], 10);
-      minute = parseInt(t24[2], 10);
-      second = t24[3] ? parseInt(t24[3], 10) : 0;
-    }
-  }
-  const ms = Date.UTC(year, month - 1, day, hour, minute, second);
-  if (isNaN(ms)) return null;
-  return new Date(ms);
 }
 
 // ---------------------------------------------------------------------------
