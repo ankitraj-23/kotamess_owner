@@ -6,10 +6,14 @@ import 'meal_request.dart';
 /// and any manual daily adjustments.
 ///
 /// Counting rules (only APPROVED requests count; pending/rejected never do):
-///   cancel_meal       lunch/dinner/both -> that meal -1
-///   both_meals_cancel -> lunch -1 and dinner -1
-///   add_meal          lunch/dinner/both -> that meal +1
+///   cancel_meal       lunch/dinner/both -> that meal's lunch_delta/dinner_delta
+///   both_meals_cancel -> lunch_delta and dinner_delta (e.g. -1 / -1, or -2 / -2)
+///   add_meal          lunch/dinner/both -> that meal's lunch_delta/dinner_delta
 ///   pause_mess        both/none -> lunch -1 and dinner -1 (lenient single-day)
+///
+/// The signed [MealRequest.lunchDelta] / [MealRequest.dinnerDelta] carry the
+/// quantity, so "kal do lunch extra dena" adds 2 lunches and "do dinner cancel"
+/// removes 2 dinners. pause_mess has no quantity meaning and stays -1 / -1.
 ///   resume_mess / dues_query / payment_note / generic_note / unclear
 ///                     -> informational only, never change the count
 class DailySummary {
@@ -128,7 +132,6 @@ class DailySummary {
       if (r.isSenderUnresolved) continue;
 
       final type = r.requestType;
-      final meal = r.mealType;
 
       if (_countAffecting.contains(type)) {
         final eff = effectiveDate(r);
@@ -138,36 +141,25 @@ class DailySummary {
         }
         if (!sameDate(eff)) continue;
 
-        switch (type) {
-          case 'cancel_meal':
-            if (meal == 'lunch' || meal == 'both') {
-              lunchCancelled++;
-              lunchCancellations.add(r);
-            }
-            if (meal == 'dinner' || meal == 'both') {
-              dinnerCancelled++;
-              dinnerCancellations.add(r);
-            }
-            break;
-          case 'both_meals_cancel':
-            lunchCancelled++;
-            dinnerCancelled++;
-            lunchCancellations.add(r);
-            dinnerCancellations.add(r);
-            break;
-          case 'pause_mess':
-            // Single-day, lenient: a pause for this date removes both meals.
-            lunchCancelled++;
-            dinnerCancelled++;
-            lunchCancellations.add(r);
-            dinnerCancellations.add(r);
-            break;
-          case 'add_meal':
-            if (meal == 'lunch' || meal == 'both') lunchAdded++;
-            if (meal == 'dinner' || meal == 'both') dinnerAdded++;
-            additions.add(r);
-            break;
+        // pause_mess has no quantity — a single-day pause is a lenient whole-day
+        // removal (-1 lunch, -1 dinner). Every other count-affecting type is
+        // driven by the signed quantity deltas (cancel = negative, add =
+        // positive), so "kal do lunch extra" adds 2 and "do dinner cancel"
+        // removes 2.
+        final lunch = type == 'pause_mess' ? -1 : r.lunchDelta;
+        final dinner = type == 'pause_mess' ? -1 : r.dinnerDelta;
+
+        if (lunch > 0) lunchAdded += lunch;
+        if (lunch < 0) {
+          lunchCancelled += -lunch;
+          lunchCancellations.add(r);
         }
+        if (dinner > 0) dinnerAdded += dinner;
+        if (dinner < 0) {
+          dinnerCancelled += -dinner;
+          dinnerCancellations.add(r);
+        }
+        if (lunch > 0 || dinner > 0) additions.add(r);
       } else {
         // Informational types: show only if dated to this day or undated.
         final eff = effectiveDate(r);

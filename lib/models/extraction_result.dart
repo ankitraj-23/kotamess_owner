@@ -7,6 +7,8 @@ class ExtractedRequest {
   final String originalMessage;
   final String requestType;
   final String mealType;
+  final int lunchDelta;
+  final int dinnerDelta;
   final String dateLabel;
   final String? requestDate;
   final double confidence;
@@ -17,6 +19,8 @@ class ExtractedRequest {
     required this.originalMessage,
     required this.requestType,
     required this.mealType,
+    this.lunchDelta = 0,
+    this.dinnerDelta = 0,
     required this.dateLabel,
     required this.requestDate,
     required this.confidence,
@@ -35,6 +39,8 @@ class ExtractedRequest {
       requestType:
           MealRequestVocab.requestTypes.contains(type) ? type : 'unclear',
       mealType: MealRequestVocab.mealTypes.contains(meal) ? meal : 'none',
+      lunchDelta: (json['lunchDelta'] as num?)?.toInt() ?? 0,
+      dinnerDelta: (json['dinnerDelta'] as num?)?.toInt() ?? 0,
       dateLabel: (json['dateLabel'] as String?)?.trim().isNotEmpty == true
           ? (json['dateLabel'] as String).trim()
           : 'unspecified',

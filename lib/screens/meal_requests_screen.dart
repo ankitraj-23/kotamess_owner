@@ -615,7 +615,16 @@ class _RequestCard extends StatelessWidget {
               runSpacing: 6,
               children: [
                 _Tag(request.requestTypeLabel),
-                if (request.mealType != 'none') _Tag(request.mealTypeLabel),
+                // Quantity deltas take priority over the plain meal label so the
+                // owner sees "Lunch +2" / "Dinner -1" at a glance. Fall back to
+                // the meal-type label only when there is no quantity change.
+                if (request.hasQuantityChange) ...[
+                  if (request.lunchDeltaLabel != null)
+                    _DeltaTag(request.lunchDeltaLabel!, request.lunchDelta),
+                  if (request.dinnerDeltaLabel != null)
+                    _DeltaTag(request.dinnerDeltaLabel!, request.dinnerDelta),
+                ] else if (request.mealType != 'none')
+                  _Tag(request.mealTypeLabel),
                 _Tag(request.dateDisplay),
                 _StatusTag(status: request.status),
                 if (request.isLateRequest) const _LateTag(),
@@ -729,6 +738,31 @@ class _Tag extends StatelessWidget {
         borderRadius: BorderRadius.circular(999),
       ),
       child: Text(text, style: const TextStyle(fontSize: 12)),
+    );
+  }
+}
+
+/// Signed quantity chip for a meal change, e.g. "Lunch +2" (green) or
+/// "Dinner -1" (red). Positive deltas add meals, negative deltas remove them.
+class _DeltaTag extends StatelessWidget {
+  final String text;
+  final int delta;
+  const _DeltaTag(this.text, this.delta);
+
+  @override
+  Widget build(BuildContext context) {
+    final positive = delta > 0;
+    final bg = positive ? const Color(0xFFDCFCE7) : const Color(0xFFFEE2E2);
+    final fg = positive ? const Color(0xFF166534) : const Color(0xFF991B1B);
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+      decoration: BoxDecoration(
+        color: bg,
+        borderRadius: BorderRadius.circular(999),
+      ),
+      child: Text(text,
+          style: TextStyle(
+              fontSize: 12, fontWeight: FontWeight.w700, color: fg)),
     );
   }
 }
@@ -879,6 +913,8 @@ class _EditRequestSheetState extends State<_EditRequestSheet> {
   late final TextEditingController _reason;
   late String _requestType;
   late String _mealType;
+  late int _lunchDelta;
+  late int _dinnerDelta;
   String? _requestDate;
 
   @override
@@ -890,6 +926,8 @@ class _EditRequestSheetState extends State<_EditRequestSheet> {
     _reason = TextEditingController(text: r.reason);
     _requestType = r.requestType;
     _mealType = r.mealType;
+    _lunchDelta = r.lunchDelta;
+    _dinnerDelta = r.dinnerDelta;
     _requestDate = r.requestDate;
   }
 
@@ -923,6 +961,8 @@ class _EditRequestSheetState extends State<_EditRequestSheet> {
     r.studentName = _name.text.trim().isEmpty ? 'Unknown' : _name.text.trim();
     r.requestType = _requestType;
     r.mealType = _mealType;
+    r.lunchDelta = _lunchDelta;
+    r.dinnerDelta = _dinnerDelta;
     r.dateLabel =
         _dateLabel.text.trim().isEmpty ? null : _dateLabel.text.trim();
     r.requestDate = _requestDate;
@@ -975,6 +1015,21 @@ class _EditRequestSheetState extends State<_EditRequestSheet> {
                   .toList(),
               onChanged: (v) => setState(() => _mealType = v ?? _mealType),
             ),
+            const SizedBox(height: 16),
+            _DeltaStepper(
+              label: 'Lunch change',
+              value: _lunchDelta,
+              onChanged: (v) => setState(() => _lunchDelta = v),
+            ),
+            const SizedBox(height: 12),
+            _DeltaStepper(
+              label: 'Dinner change',
+              value: _dinnerDelta,
+              onChanged: (v) => setState(() => _dinnerDelta = v),
+            ),
+            const SizedBox(height: 6),
+            Text('+2 means add 2, -1 means cancel/remove 1',
+                style: TextStyle(color: Colors.grey.shade600, fontSize: 12)),
             const SizedBox(height: 12),
             TextField(
               controller: _dateLabel,
@@ -1035,6 +1090,90 @@ class _EditRequestSheetState extends State<_EditRequestSheet> {
           ],
         ),
       ),
+    );
+  }
+}
+
+/// Plus/minus stepper for a signed meal-quantity delta. Supports positive,
+/// negative and zero values; the middle field accepts direct integer entry
+/// (including a leading "-") and ignores anything non-integer.
+class _DeltaStepper extends StatefulWidget {
+  final String label;
+  final int value;
+  final ValueChanged<int> onChanged;
+  const _DeltaStepper({
+    required this.label,
+    required this.value,
+    required this.onChanged,
+  });
+
+  @override
+  State<_DeltaStepper> createState() => _DeltaStepperState();
+}
+
+class _DeltaStepperState extends State<_DeltaStepper> {
+  late final TextEditingController _controller =
+      TextEditingController(text: widget.value.toString());
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  void _set(int v) {
+    widget.onChanged(v);
+    final text = v.toString();
+    if (_controller.text != text) {
+      _controller.value = TextEditingValue(
+        text: text,
+        selection: TextSelection.collapsed(offset: text.length),
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      children: [
+        Expanded(
+          child: Text(widget.label,
+              style: const TextStyle(fontWeight: FontWeight.w600)),
+        ),
+        IconButton(
+          tooltip: 'Decrease',
+          icon: const Icon(Icons.remove_circle_outline),
+          onPressed: () => _set(widget.value - 1),
+        ),
+        SizedBox(
+          width: 56,
+          child: TextField(
+            controller: _controller,
+            textAlign: TextAlign.center,
+            keyboardType:
+                const TextInputType.numberWithOptions(signed: true),
+            decoration: const InputDecoration(
+              isDense: true,
+              contentPadding:
+                  EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+            ),
+            onChanged: (text) {
+              final t = text.trim();
+              if (t.isEmpty || t == '-') {
+                widget.onChanged(0);
+                return;
+              }
+              final parsed = int.tryParse(t);
+              if (parsed != null) widget.onChanged(parsed);
+            },
+          ),
+        ),
+        IconButton(
+          tooltip: 'Increase',
+          icon: const Icon(Icons.add_circle_outline),
+          onPressed: () => _set(widget.value + 1),
+        ),
+      ],
     );
   }
 }

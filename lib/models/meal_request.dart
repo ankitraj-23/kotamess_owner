@@ -11,6 +11,15 @@ class MealRequest {
   final String originalMessage;
   String requestType;
   String mealType;
+
+  /// Signed quantity change for each meal (0003+ quantity deltas, 0014).
+  ///   +N  -> add N of that meal
+  ///   -N  -> remove / cancel N of that meal
+  ///    0  -> no change for that meal
+  /// e.g. "kal do lunch extra dena" -> [lunchDelta] = +2, [dinnerDelta] = 0.
+  int lunchDelta;
+  int dinnerDelta;
+
   String? requestDate; // 'YYYY-MM-DD' or null
   String? dateLabel;
   String status;
@@ -56,6 +65,8 @@ class MealRequest {
     required this.originalMessage,
     required this.requestType,
     required this.mealType,
+    this.lunchDelta = 0,
+    this.dinnerDelta = 0,
     required this.requestDate,
     required this.dateLabel,
     required this.status,
@@ -87,6 +98,8 @@ class MealRequest {
       originalMessage: json['original_message'] as String? ?? '',
       requestType: json['request_type'] as String? ?? 'unclear',
       mealType: json['meal_type'] as String? ?? 'none',
+      lunchDelta: (json['lunch_delta'] as num?)?.toInt() ?? 0,
+      dinnerDelta: (json['dinner_delta'] as num?)?.toInt() ?? 0,
       requestDate: json['request_date'] as String?,
       dateLabel: json['date_label'] as String?,
       status: json['status'] as String? ?? 'pending',
@@ -120,6 +133,8 @@ class MealRequest {
       'student_name': studentName.trim(),
       'request_type': requestType,
       'meal_type': mealType,
+      'lunch_delta': lunchDelta,
+      'dinner_delta': dinnerDelta,
       'request_date': requestDate,
       'date_label': dateLabel,
       'reason': reason.trim(),
@@ -130,6 +145,19 @@ class MealRequest {
   String get requestTypeLabel => MealRequestVocab.typeLabel(requestType);
   String get mealTypeLabel => MealRequestVocab.mealLabel(mealType);
   String get statusLabel => MealRequestVocab.statusLabel(status);
+
+  /// True when this request carries an explicit quantity change for either meal.
+  bool get hasQuantityChange => lunchDelta != 0 || dinnerDelta != 0;
+
+  /// Short signed labels for the request card chips, e.g. "Lunch +2",
+  /// "Dinner -1". Returns null for a meal with no change so the card can skip
+  /// the chip (a 0 delta is not shown prominently).
+  String? get lunchDeltaLabel =>
+      lunchDelta == 0 ? null : 'Lunch ${_signed(lunchDelta)}';
+  String? get dinnerDeltaLabel =>
+      dinnerDelta == 0 ? null : 'Dinner ${_signed(dinnerDelta)}';
+
+  static String _signed(int v) => v > 0 ? '+$v' : '$v';
 
   /// The single source of truth for "may this request be approved/confirmed?".
   /// A request is approvable only when it resolves to a real customer:

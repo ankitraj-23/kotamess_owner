@@ -32,6 +32,7 @@ import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient, SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { isGroupSystemLine, parseRosterEvents } from "./roster_parser.ts";
 import { messageFingerprint, parseTimestamp } from "./fingerprint.ts";
+import { clampDelta, deltasFor, detectQuantity } from "./quantity.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -78,6 +79,10 @@ interface ExtractedRequest {
   originalMessage: string;
   requestType: string;
   mealType: string;
+  // Signed per-meal quantity change. +N adds N, -N removes/cancels N, 0 = no
+  // change. e.g. "kal do lunch extra dena" -> lunchDelta +2, dinnerDelta 0.
+  lunchDelta: number;
+  dinnerDelta: number;
   dateLabel: string;
   requestDate: string | null;
   confidence: number;
@@ -404,6 +409,8 @@ serve(async (req: Request): Promise<Response> => {
         original_message: r.originalMessage,
         request_type: r.requestType,
         meal_type: r.mealType,
+        lunch_delta: r.lunchDelta,
+        dinner_delta: r.dinnerDelta,
         request_date: r.requestDate,
         date_label: r.dateLabel,
         status: "pending", // confidence<0.6 / unclear / ambiguous are also pending (needs review)
@@ -1065,6 +1072,8 @@ async function loadExistingDupKeys(
       originalMessage: (row.original_message as string) ?? "",
       requestType: (row.request_type as string) ?? "unclear",
       mealType: (row.meal_type as string) ?? "none",
+      lunchDelta: 0, // not part of the duplicate identity key
+      dinnerDelta: 0,
       dateLabel: (row.date_label as string) ?? "",
       requestDate: (row.request_date as string) ?? null,
       confidence: 0,
@@ -1128,7 +1137,7 @@ type Candidate = ChatMessage;
 // only a cheap prefilter to cut volume. Anything matched here still goes to the
 // model (or the fallback parser) for the real decision.
 const CANDIDATE_RE =
-  /(lunch|dinner|meal|tiffin|dabba|mess|khana|khane|roti|rice|sabzi|plate|cancel|nahi|nahin|nhi|mat banana|mat bhejna|skip|band|bandh|chhutti|chutti|pause|ghar ja|out of station|start|resume|restart|chalu|shuru|continue|payment|paid|pay kar|bhej diya|de diya|transfer|upi|gpay|phonepe|paytm|due|baki|balance|hisab|hisaab|kitna|add|extra|badha|zyada)/;
+  /(lunch|dinner|meal|tiffin|dabba|mess|khana|khane|roti|rice|sabzi|plate|cancel|nahi|nahin|nhi|mat banana|mat bhejna|skip|band|bandh|chhutti|chutti|pause|ghar ja|out of station|start|resume|restart|chalu|shuru|continue|payment|paid|pay kar|bhej diya|de diya|transfer|upi|gpay|phonepe|paytm|due|baki|balance|hisab|hisaab|kitna|add|extra|badha|zyada|kam|hata|ghata|remove)/;
 
 function isCandidate(text: string): boolean {
   const lower = normalize(text);
@@ -1328,6 +1337,8 @@ Return ONLY a JSON object of this exact shape:
       "originalMessage": string,    // the message text, preserved
       "requestType": one of [${REQUEST_TYPES.map((t) => `"${t}"`).join(", ")}],
       "mealType": one of [${MEAL_TYPES.map((t) => `"${t}"`).join(", ")}],
+      "lunchDelta": number,         // signed change to lunches: +N adds N, -N removes N, 0 = no change
+      "dinnerDelta": number,        // signed change to dinners: +N adds N, -N removes N, 0 = no change
       "dateLabel": string,          // e.g. "today","tomorrow","Sunday","unspecified"
       "requestDate": "YYYY-MM-DD" | null,
       "confidence": number,         // 0..1
@@ -1347,6 +1358,24 @@ Request type guidance:
 - payment_note: says they paid ("payment bhej diya").
 - generic_note: relevant but none of the above.
 - unclear: mess-related but ambiguous (low confidence).
+
+Quantity (lunchDelta / dinnerDelta) guidance:
+- Requests can change MORE THAN ONE meal. Read the number and the direction.
+- Numbers may be digits (1,2,3) or Hindi/Hinglish words: ek/one=1, do/two=2,
+  teen/three=3, char/chaar/four=4, paanch/panch/five=5.
+- Positive (add) words: extra, add, aur, jyada/zyada, badha, "extra dena".
+- Negative (remove) words: cancel, kam, hata, remove, nahi, "mat dena".
+- If no explicit number, the quantity is 1.
+- In Hinglish "do" before a meal word means the NUMBER 2 (e.g. "do lunch extra",
+  "do dinner cancel", "do lunch kam"). "kar do" at the end just means "do it" —
+  not a number.
+- Examples: "kal do lunch extra dena" -> lunchDelta +2, dinnerDelta 0;
+  "aaj 3 dinner extra" -> dinnerDelta +3; "kal 2 lunch kam kar dena" ->
+  lunchDelta -2; "do dinner cancel kar dena" -> dinnerDelta -2;
+  "lunch dinner cancel" -> lunchDelta -1, dinnerDelta -1.
+- For add_meal use positive deltas; for cancel_meal / both_meals_cancel use
+  negative deltas; for non-meal types (pause/resume/payment/dues/note/unclear)
+  set both deltas to 0.
 
 Rules:
 - Always include the source "messageIndex" for every request.
@@ -1391,6 +1420,25 @@ function normalizeRequest(r: any, today: string): ExtractedRequest | null {
   let mealType = String(r.mealType ?? r.meal_type ?? "none");
   if (!MEAL_TYPES.includes(mealType)) mealType = "none";
 
+  // Quantity deltas. Prefer the model's explicit numbers; otherwise derive them
+  // from the request type + meal + a quantity parsed from the message. Non-meal
+  // types never carry a delta, so a note/payment can't move a cook count.
+  let lunchDelta = 0;
+  let dinnerDelta = 0;
+  if (["add_meal", "cancel_meal", "both_meals_cancel"].includes(requestType)) {
+    const rawL = r.lunchDelta ?? r.lunch_delta;
+    const rawD = r.dinnerDelta ?? r.dinner_delta;
+    if (rawL != null && Number.isFinite(Number(rawL)) &&
+        rawD != null && Number.isFinite(Number(rawD))) {
+      lunchDelta = clampDelta(Number(rawL));
+      dinnerDelta = clampDelta(Number(rawD));
+    } else {
+      const d = deltasFor(requestType, mealType, detectQuantity(normalize(originalMessage)));
+      lunchDelta = d.lunch;
+      dinnerDelta = d.dinner;
+    }
+  }
+
   let confidence = Number(r.confidence);
   if (!isFinite(confidence)) confidence = 0.5;
   confidence = Math.max(0, Math.min(1, confidence));
@@ -1411,6 +1459,8 @@ function normalizeRequest(r: any, today: string): ExtractedRequest | null {
     originalMessage,
     requestType,
     mealType,
+    lunchDelta,
+    dinnerDelta,
     dateLabel,
     requestDate,
     confidence,
@@ -1646,7 +1696,8 @@ function classify(msg: ChatMessage, today: string): ExtractedRequest | null {
 
   const cancelWords = has([
     "cancel", "nahi chahiye", "nhi chahiye", "nahin chahiye", "mat banana",
-    "mat bhejna", "skip", "nahi banana", "no lunch", "no dinner", "band karo",
+    "mat bhejna", "mat dena", "skip", "nahi banana", "no lunch", "no dinner",
+    "band karo", "kam", "hata", "ghata", "remove",
   ]);
   const bothWords = has(["dono", "both", "donon"]);
 
@@ -1689,11 +1740,16 @@ function classify(msg: ChatMessage, today: string): ExtractedRequest | null {
     confidence -= 0.1;
   }
 
+  const finalMeal = requestType === "both_meals_cancel" ? "both" : mealType;
+  const { lunch, dinner } = deltasFor(requestType, finalMeal, detectQuantity(lower));
+
   return {
     studentName: cleanSender(msg.sender),
     originalMessage: text,
     requestType,
-    mealType: requestType === "both_meals_cancel" ? "both" : mealType,
+    mealType: finalMeal,
+    lunchDelta: lunch,
+    dinnerDelta: dinner,
     dateLabel,
     requestDate,
     confidence: Math.max(0, Math.min(1, confidence)),
