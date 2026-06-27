@@ -99,6 +99,21 @@ class DailySummary {
     return null;
   }
 
+  /// The inclusive END of a request's date range, given its resolved [start].
+  /// Uses [MealRequest.requestEndDate] when it is a valid date on/after [start];
+  /// otherwise the request is single-day and the end equals the start.
+  static DateTime _rangeEnd(MealRequest r, DateTime start) {
+    final e = r.requestEndDate;
+    if (e != null && e.isNotEmpty) {
+      final p = DateTime.tryParse(e);
+      if (p != null) {
+        final ed = DateTime(p.year, p.month, p.day);
+        if (!ed.isBefore(start)) return ed;
+      }
+    }
+    return start;
+  }
+
   factory DailySummary.compute({
     required String date,
     required int baseLunch,
@@ -139,7 +154,16 @@ class DailySummary {
           needsDateReview.add(r);
           continue;
         }
-        if (!sameDate(eff)) continue;
+        // A request applies to the selected date when it falls inside its
+        // inclusive [start, end] range. For a single-day request end == start,
+        // so this reduces to the previous same-day behavior. A multi-day pause
+        // ("kal se ek hafte tak") counts on every day in the week.
+        final end = _rangeEnd(r, eff);
+        if (selectedDate == null ||
+            selectedDate.isBefore(eff) ||
+            selectedDate.isAfter(end)) {
+          continue;
+        }
 
         // pause_mess has no quantity — a single-day pause is a lenient whole-day
         // removal (-1 lunch, -1 dinner). Every other count-affecting type is

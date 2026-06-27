@@ -20,7 +20,13 @@ class MealRequest {
   int lunchDelta;
   int dinnerDelta;
 
-  String? requestDate; // 'YYYY-MM-DD' or null
+  String? requestDate; // 'YYYY-MM-DD' or null — START date of the request
+
+  /// Inclusive END date for a multi-day pause/cancel (0015). null = single-day
+  /// request (treat as [requestDate]). The per-meal [lunchDelta]/[dinnerDelta]
+  /// apply to every day in [requestDate]..[requestEndDate].
+  String? requestEndDate;
+
   String? dateLabel;
   String status;
   final double confidence;
@@ -68,6 +74,7 @@ class MealRequest {
     this.lunchDelta = 0,
     this.dinnerDelta = 0,
     required this.requestDate,
+    this.requestEndDate,
     required this.dateLabel,
     required this.status,
     required this.confidence,
@@ -101,6 +108,7 @@ class MealRequest {
       lunchDelta: (json['lunch_delta'] as num?)?.toInt() ?? 0,
       dinnerDelta: (json['dinner_delta'] as num?)?.toInt() ?? 0,
       requestDate: json['request_date'] as String?,
+      requestEndDate: json['request_end_date'] as String?,
       dateLabel: json['date_label'] as String?,
       status: json['status'] as String? ?? 'pending',
       confidence: (json['confidence'] as num?)?.toDouble() ?? 0.0,
@@ -136,6 +144,7 @@ class MealRequest {
       'lunch_delta': lunchDelta,
       'dinner_delta': dinnerDelta,
       'request_date': requestDate,
+      'request_end_date': requestEndDate,
       'date_label': dateLabel,
       'reason': reason.trim(),
       'owner_note': ownerNote.trim(),
@@ -237,6 +246,40 @@ class MealRequest {
     if (requestDate != null && requestDate!.isNotEmpty) return requestDate!;
     final label = dateLabel?.trim();
     return (label == null || label.isEmpty) ? 'unspecified' : label;
+  }
+
+  /// The effective end of the request's date range: [requestEndDate] when set,
+  /// otherwise the start date (a single-day request).
+  String? get effectiveEndDate {
+    final e = requestEndDate;
+    if (e != null && e.isNotEmpty) return e;
+    return requestDate;
+  }
+
+  /// True when this request spans more than one day (a real range).
+  bool get isRangeRequest {
+    final start = requestDate;
+    final end = effectiveEndDate;
+    return start != null && end != null && start.isNotEmpty && end != start;
+  }
+
+  /// Date display that shows a range when applicable, e.g. "28 Jun – 04 Jul";
+  /// otherwise falls back to the single-day [dateDisplay].
+  String get dateRangeDisplay {
+    if (!isRangeRequest) return dateDisplay;
+    return '${_shortDate(requestDate!)} – ${_shortDate(effectiveEndDate!)}';
+  }
+
+  static const _months = [
+    'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+    'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
+  ];
+
+  /// 'YYYY-MM-DD' -> '28 Jun'. Returns the raw string if it can't be parsed.
+  static String _shortDate(String iso) {
+    final d = DateTime.tryParse(iso);
+    if (d == null) return iso;
+    return '${d.day} ${_months[d.month - 1]}';
   }
 }
 

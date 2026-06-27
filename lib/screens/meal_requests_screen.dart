@@ -334,6 +334,7 @@ class MealRequestsScreenState extends State<MealRequestsScreen> {
         studentId: result.studentId,
         studentName: result.studentName,
         requestDate: result.requestDate,
+        requestEndDate: result.requestEndDate,
         lunchDelta: result.lunchDelta,
         dinnerDelta: result.dinnerDelta,
         ownerNote: result.ownerNote,
@@ -672,7 +673,7 @@ class _RequestCard extends StatelessWidget {
                     _DeltaTag(request.dinnerDeltaLabel!, request.dinnerDelta),
                 ] else if (request.mealType != 'none')
                   _Tag(request.mealTypeLabel),
-                _Tag(request.dateDisplay),
+                _Tag(request.dateRangeDisplay),
                 if (request.isManual) const _Tag('Manual'),
                 _StatusTag(status: request.status),
                 if (request.isLateRequest) const _LateTag(),
@@ -964,6 +965,8 @@ class _EditRequestSheetState extends State<_EditRequestSheet> {
   late int _lunchDelta;
   late int _dinnerDelta;
   String? _requestDate;
+  String? _requestEndDate;
+  String? _error;
 
   @override
   void initState() {
@@ -977,6 +980,7 @@ class _EditRequestSheetState extends State<_EditRequestSheet> {
     _lunchDelta = r.lunchDelta;
     _dinnerDelta = r.dinnerDelta;
     _requestDate = r.requestDate;
+    _requestEndDate = r.requestEndDate;
   }
 
   @override
@@ -986,6 +990,14 @@ class _EditRequestSheetState extends State<_EditRequestSheet> {
     _reason.dispose();
     super.dispose();
   }
+
+  static String _fmt(DateTime d) =>
+      '${d.year.toString().padLeft(4, '0')}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
+
+  bool get _isRange =>
+      _requestDate != null &&
+      _requestEndDate != null &&
+      _requestEndDate!.compareTo(_requestDate!) > 0;
 
   Future<void> _pickDate() async {
     final now = DateTime.now();
@@ -998,13 +1010,43 @@ class _EditRequestSheetState extends State<_EditRequestSheet> {
     );
     if (picked != null) {
       setState(() {
-        _requestDate =
-            '${picked.year.toString().padLeft(4, '0')}-${picked.month.toString().padLeft(2, '0')}-${picked.day.toString().padLeft(2, '0')}';
+        _requestDate = _fmt(picked);
+        if (_requestEndDate != null &&
+            _requestEndDate!.compareTo(_requestDate!) < 0) {
+          _requestEndDate = _requestDate;
+        }
+        _error = null;
+      });
+    }
+  }
+
+  Future<void> _pickEndDate() async {
+    final now = DateTime.now();
+    final initial =
+        DateTime.tryParse(_requestEndDate ?? _requestDate ?? '') ?? now;
+    final picked = await showDatePicker(
+      context: context,
+      initialDate: initial,
+      firstDate: DateTime(now.year - 1),
+      lastDate: DateTime(now.year + 1),
+    );
+    if (picked != null) {
+      setState(() {
+        _requestEndDate = _fmt(picked);
+        _error = null;
       });
     }
   }
 
   void _save() {
+    // Range validation: an end date is only allowed on/after the start date.
+    if (_requestDate != null &&
+        _requestEndDate != null &&
+        _requestEndDate!.compareTo(_requestDate!) < 0) {
+      setState(() => _error =
+          'To date must be the same as or after the from date.');
+      return;
+    }
     final r = widget.original;
     r.studentName = _name.text.trim().isEmpty ? 'Unknown' : _name.text.trim();
     r.requestType = _requestType;
@@ -1014,6 +1056,12 @@ class _EditRequestSheetState extends State<_EditRequestSheet> {
     r.dateLabel =
         _dateLabel.text.trim().isEmpty ? null : _dateLabel.text.trim();
     r.requestDate = _requestDate;
+    // Store an end date only for a real multi-day range; clear it otherwise.
+    r.requestEndDate = (_requestDate != null &&
+            _requestEndDate != null &&
+            _requestEndDate!.compareTo(_requestDate!) > 0)
+        ? _requestEndDate
+        : null;
     r.reason = _reason.text.trim();
     Navigator.pop(context, r);
   }
@@ -1092,21 +1140,62 @@ class _EditRequestSheetState extends State<_EditRequestSheet> {
                 Expanded(
                   child: Text(_requestDate == null
                       ? 'No exact date'
-                      : 'Date: $_requestDate'),
+                      : 'From: $_requestDate'),
                 ),
                 TextButton.icon(
                   onPressed: _pickDate,
                   icon: const Icon(Icons.calendar_today, size: 18),
-                  label: const Text('Pick date'),
+                  label: const Text('From date'),
                 ),
                 if (_requestDate != null)
                   IconButton(
-                    tooltip: 'Clear date',
+                    tooltip: 'Clear dates',
                     icon: const Icon(Icons.clear),
-                    onPressed: () => setState(() => _requestDate = null),
+                    onPressed: () => setState(() {
+                      _requestDate = null;
+                      _requestEndDate = null;
+                    }),
                   ),
               ],
             ),
+            // A "To" date only makes sense once a start date is set.
+            if (_requestDate != null)
+              Row(
+                children: [
+                  Expanded(
+                    child: Text(_requestEndDate == null
+                        ? 'To: (single day)'
+                        : 'To: $_requestEndDate'),
+                  ),
+                  TextButton.icon(
+                    onPressed: _pickEndDate,
+                    icon: const Icon(Icons.event, size: 18),
+                    label: const Text('To date'),
+                  ),
+                  if (_requestEndDate != null)
+                    IconButton(
+                      tooltip: 'Clear to date',
+                      icon: const Icon(Icons.clear),
+                      onPressed: () => setState(() => _requestEndDate = null),
+                    ),
+                ],
+              ),
+            if (_isRange) ...[
+              const SizedBox(height: 4),
+              Text('This change applies to every day in the selected date range.',
+                  style: TextStyle(
+                      color: Colors.blue.shade700,
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600)),
+            ],
+            if (_error != null) ...[
+              const SizedBox(height: 8),
+              Text(_error!,
+                  style: TextStyle(
+                      color: Colors.red.shade700,
+                      fontSize: 13,
+                      fontWeight: FontWeight.w600)),
+            ],
             const SizedBox(height: 12),
             TextField(
               controller: _reason,
@@ -1231,7 +1320,8 @@ class _DeltaStepperState extends State<_DeltaStepper> {
 class _ManualRequestData {
   final String studentId;
   final String studentName;
-  final String requestDate; // 'YYYY-MM-DD'
+  final String requestDate; // 'YYYY-MM-DD' (start)
+  final String requestEndDate; // 'YYYY-MM-DD' (inclusive end; == start = single day)
   final int lunchDelta;
   final int dinnerDelta;
   final String ownerNote;
@@ -1239,6 +1329,7 @@ class _ManualRequestData {
     required this.studentId,
     required this.studentName,
     required this.requestDate,
+    required this.requestEndDate,
     required this.lunchDelta,
     required this.dinnerDelta,
     required this.ownerNote,
@@ -1260,7 +1351,8 @@ class _ManualRequestSheet extends StatefulWidget {
 class _ManualRequestSheetState extends State<_ManualRequestSheet> {
   final _note = TextEditingController();
   String? _studentId;
-  late String _requestDate;
+  late String _fromDate;
+  late String _toDate;
   int _lunchDelta = 0;
   int _dinnerDelta = 0;
   String? _error;
@@ -1268,8 +1360,9 @@ class _ManualRequestSheetState extends State<_ManualRequestSheet> {
   @override
   void initState() {
     super.initState();
-    final now = DateTime.now();
-    _requestDate = _fmt(now);
+    final now = _fmt(DateTime.now());
+    _fromDate = now;
+    _toDate = now; // single-day default
   }
 
   @override
@@ -1281,22 +1374,50 @@ class _ManualRequestSheetState extends State<_ManualRequestSheet> {
   static String _fmt(DateTime d) =>
       '${d.year.toString().padLeft(4, '0')}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
 
-  Future<void> _pickDate() async {
+  bool get _isRange => _toDate.compareTo(_fromDate) > 0;
+
+  Future<void> _pickFrom() async {
     final now = DateTime.now();
-    final initial = DateTime.tryParse(_requestDate) ?? now;
     final picked = await showDatePicker(
       context: context,
-      initialDate: initial,
+      initialDate: DateTime.tryParse(_fromDate) ?? now,
       firstDate: DateTime(now.year - 1),
       lastDate: DateTime(now.year + 1),
     );
-    if (picked != null) setState(() => _requestDate = _fmt(picked));
+    if (picked != null) {
+      setState(() {
+        _fromDate = _fmt(picked);
+        // Keep the range valid: never let the end fall before the start.
+        if (_toDate.compareTo(_fromDate) < 0) _toDate = _fromDate;
+        _error = null;
+      });
+    }
+  }
+
+  Future<void> _pickTo() async {
+    final now = DateTime.now();
+    final picked = await showDatePicker(
+      context: context,
+      initialDate: DateTime.tryParse(_toDate) ?? now,
+      firstDate: DateTime(now.year - 1),
+      lastDate: DateTime(now.year + 1),
+    );
+    if (picked != null) {
+      setState(() {
+        _toDate = _fmt(picked);
+        _error = null;
+      });
+    }
   }
 
   void _save() {
     final id = _studentId;
     if (id == null) {
       setState(() => _error = 'Choose a customer.');
+      return;
+    }
+    if (_toDate.compareTo(_fromDate) < 0) {
+      setState(() => _error = 'To date must be the same as or after the from date.');
       return;
     }
     if (_lunchDelta == 0 && _dinnerDelta == 0) {
@@ -1310,7 +1431,8 @@ class _ManualRequestSheetState extends State<_ManualRequestSheet> {
       _ManualRequestData(
         studentId: id,
         studentName: student.name,
-        requestDate: _requestDate,
+        requestDate: _fromDate,
+        requestEndDate: _toDate,
         lunchDelta: _lunchDelta,
         dinnerDelta: _dinnerDelta,
         ownerNote: _note.text.trim(),
@@ -1356,14 +1478,32 @@ class _ManualRequestSheetState extends State<_ManualRequestSheet> {
             const SizedBox(height: 12),
             Row(
               children: [
-                Expanded(child: Text('Date: $_requestDate')),
+                Expanded(child: Text('From: $_fromDate')),
                 TextButton.icon(
-                  onPressed: _pickDate,
+                  onPressed: _pickFrom,
                   icon: const Icon(Icons.calendar_today, size: 18),
-                  label: const Text('Pick date'),
+                  label: const Text('From date'),
                 ),
               ],
             ),
+            Row(
+              children: [
+                Expanded(child: Text('To: $_toDate')),
+                TextButton.icon(
+                  onPressed: _pickTo,
+                  icon: const Icon(Icons.event, size: 18),
+                  label: const Text('To date'),
+                ),
+              ],
+            ),
+            if (_isRange) ...[
+              const SizedBox(height: 4),
+              Text('This change applies to every day in the selected date range.',
+                  style: TextStyle(
+                      color: Colors.blue.shade700,
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600)),
+            ],
             const SizedBox(height: 12),
             _DeltaStepper(
               label: 'Lunch change',

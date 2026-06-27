@@ -426,12 +426,18 @@ class DatabaseService {
   Future<MealRequest> createManualMealRequest({
     required String studentId,
     required String studentName,
-    required String requestDate, // 'YYYY-MM-DD'
+    required String requestDate, // 'YYYY-MM-DD' (start)
+    String? requestEndDate, // 'YYYY-MM-DD' (inclusive end); null/equal = single day
     required int lunchDelta,
     required int dinnerDelta,
     String ownerNote = '',
   }) async {
     final ownerId = getCurrentOwnerId();
+    // Store an end date only for a real multi-day range (end after start).
+    final endDate =
+        (requestEndDate != null && requestEndDate.compareTo(requestDate) > 0)
+            ? requestEndDate
+            : null;
 
     // Derive a natural request_type / meal_type from the deltas so the request
     // lists and labels read sensibly. The Daily count is delta-driven (see
@@ -463,6 +469,7 @@ class DatabaseService {
       'lunch_delta': lunchDelta,
       'dinner_delta': dinnerDelta,
       'request_date': requestDate,
+      'request_end_date': endDate,
       'status': 'approved', // owner-entered -> already confirmed
       'confidence': 1.0,
       'reason': 'Added manually by owner.',
@@ -485,6 +492,7 @@ class DatabaseService {
         'lunch_delta': lunchDelta,
         'dinner_delta': dinnerDelta,
         'request_date': requestDate,
+        'request_end_date': endDate,
         'source': 'manual',
       },
     );

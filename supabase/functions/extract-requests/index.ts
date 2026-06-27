@@ -33,7 +33,11 @@ import { createClient, SupabaseClient } from "https://esm.sh/@supabase/supabase-
 import { isGroupSystemLine, parseRosterEvents } from "./roster_parser.ts";
 import { messageFingerprint, parseTimestamp } from "./fingerprint.ts";
 import { clampDelta, deltasFor, detectQuantity } from "./quantity.ts";
-import { resolveMealDateFromText } from "./dates.ts";
+import {
+  detectDurationDays,
+  resolveMealDateFromText,
+  resolveMealDateRangeFromText,
+} from "./dates.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -86,6 +90,10 @@ interface ExtractedRequest {
   dinnerDelta: number;
   dateLabel: string;
   requestDate: string | null;
+  // Inclusive end date for a multi-day pause/cancel ("kal se ek hafte tak").
+  // null = single-day request (treat as requestDate). The per-meal deltas apply
+  // to every day in [requestDate, requestEndDate].
+  requestEndDate: string | null;
   confidence: number;
   reason: string;
 }
@@ -413,6 +421,7 @@ serve(async (req: Request): Promise<Response> => {
         lunch_delta: r.lunchDelta,
         dinner_delta: r.dinnerDelta,
         request_date: r.requestDate,
+        request_end_date: r.requestEndDate,
         date_label: r.dateLabel,
         status: "pending", // confidence<0.6 / unclear / ambiguous are also pending (needs review)
         confidence: r.confidence,
@@ -1077,6 +1086,7 @@ async function loadExistingDupKeys(
       dinnerDelta: 0,
       dateLabel: (row.date_label as string) ?? "",
       requestDate: (row.request_date as string) ?? null,
+      requestEndDate: null, // not part of the duplicate identity key
       confidence: 0,
       reason: "",
     };
@@ -1344,7 +1354,8 @@ Return ONLY a JSON object of this exact shape:
       "lunchDelta": number,         // signed change to lunches: +N adds N, -N removes N, 0 = no change
       "dinnerDelta": number,        // signed change to dinners: +N adds N, -N removes N, 0 = no change
       "dateLabel": string,          // e.g. "today","tomorrow","day_after_tomorrow","Sunday","unspecified"
-      "requestDate": "YYYY-MM-DD" | null,
+      "requestDate": "YYYY-MM-DD" | null,     // START date of the request
+      "requestEndDate": "YYYY-MM-DD" | null,  // END date (inclusive) for a multi-day pause; null if single day
       "confidence": number,         // 0..1
       "reason": string              // short why
     }
@@ -1397,6 +1408,19 @@ Rules:
   (These are operational mess requests, so "kal" always means TOMORROW, never
   yesterday.) An explicit calendar date in the text (e.g. "28 June", "28/06")
   takes priority over a relative word. Output requestDate as "YYYY-MM-DD".
+- Date RANGE / multi-day pause: when a duration is given, set requestDate to the
+  START day and requestEndDate to the inclusive END day. end = start + duration
+  - 1. Durations: "ek hafte / 1 hafte / one week / for a week" = 7 days;
+  "<n> din tak" / "for <n> days" = n days (ek/do/teen/chaar/paanch = 1..5).
+    * "kal se ek hafte tak khana mat dena" -> start = message date + 1, end =
+      start + 6 (7 days), and it cancels BOTH meals every day: lunchDelta -1,
+      dinnerDelta -1.
+    * "aaj se 2 din khana band" -> start = message date, end = start + 1.
+  The deltas are PER DAY (each day in the range), so a pause is -1/-1, NOT the
+  duration number. If there is no duration, set requestEndDate to null.
+- "khana mat dena" / "khana band" / "mess band" / "food/meal mat dena" with no
+  specific meal named = both meals: lunchDelta -1, dinnerDelta -1. If only lunch
+  or only dinner is named, change just that meal.
 - confidence is 0..1; use low confidence for ambiguous messages.
 - If a message has no timestamp/date context, lean toward lower confidence when
   the timing is what makes it actionable.
@@ -1450,7 +1474,13 @@ function normalizeRequest(
       lunchDelta = clampDelta(Number(rawL));
       dinnerDelta = clampDelta(Number(rawD));
     } else {
-      const d = deltasFor(requestType, mealType, detectQuantity(normalize(originalMessage)));
+      // A date-range pause is a per-day -1, so a duration number ("3 din") must
+      // not be read as the meal quantity. Force quantity 1 when a duration is
+      // present; otherwise use the normal quantity parser.
+      const qty = detectDurationDays(originalMessage) != null
+        ? 1
+        : detectQuantity(normalize(originalMessage));
+      const d = deltasFor(requestType, mealType, qty);
       lunchDelta = d.lunch;
       dinnerDelta = d.dinner;
     }
@@ -1466,13 +1496,27 @@ function normalizeRequest(
   let dateLabel = String(r.dateLabel ?? r.date_label ?? "unspecified").trim() ||
     "unspecified";
   let requestDate: string | null = null;
+  const range = resolveMealDateRangeFromText(originalMessage, messageTs, today);
   const rawDate = r.requestDate ?? r.request_date;
   if (typeof rawDate === "string" && /^\d{4}-\d{2}-\d{2}$/.test(rawDate)) {
     requestDate = rawDate;
   } else {
-    const dr = resolveMealDateFromText(originalMessage, messageTs, today);
-    requestDate = dr.date;
-    if (dr.label !== "unspecified") dateLabel = dr.label;
+    requestDate = range.startDate;
+    if (range.label !== "unspecified") dateLabel = range.label;
+  }
+
+  // End date (req.): an explicit yyyy-mm-dd the model resolved wins (kept only
+  // when it is on/after the start); otherwise derive it from a duration phrase.
+  // null = single-day request.
+  let requestEndDate: string | null = null;
+  const rawEnd = r.requestEndDate ?? r.request_end_date;
+  if (
+    typeof rawEnd === "string" && /^\d{4}-\d{2}-\d{2}$/.test(rawEnd) &&
+    requestDate && rawEnd > requestDate
+  ) {
+    requestEndDate = rawEnd;
+  } else if (range.endDate && requestDate && range.endDate > requestDate) {
+    requestEndDate = range.endDate;
   }
 
   return {
@@ -1485,6 +1529,7 @@ function normalizeRequest(
     dinnerDelta,
     dateLabel,
     requestDate,
+    requestEndDate,
     confidence,
     reason: String(r.reason ?? "").trim(),
   };
@@ -1710,13 +1755,16 @@ function classify(msg: ChatMessage, today: string): ExtractedRequest | null {
   const has = (terms: string[]) => terms.some((t) => lower.includes(t));
 
   const mealType = detectMeal(lower);
-  // Resolve the meal date against the MESSAGE timestamp (not the import date),
-  // falling back to `today` only when the message has no usable timestamp.
-  const { label: dateLabel, date: requestDate } = resolveMealDateFromText(
-    text,
-    parseTimestamp(msg.dateText),
-    today,
-  );
+  // Resolve the meal date(s) against the MESSAGE timestamp (not the import
+  // date), falling back to `today` only when the message has no usable
+  // timestamp. A duration ("ek hafte tak", "2 din") yields an inclusive end
+  // date for a multi-day pause; otherwise endDate is null (single day).
+  const {
+    label: dateLabel,
+    startDate: requestDate,
+    endDate: requestEndDate,
+    durationDays,
+  } = resolveMealDateRangeFromText(text, parseTimestamp(msg.dateText), today);
 
   let requestType: string | null = null;
   let confidence = 0.55;
@@ -1767,8 +1815,23 @@ function classify(msg: ChatMessage, today: string): ExtractedRequest | null {
     confidence -= 0.1;
   }
 
-  const finalMeal = requestType === "both_meals_cancel" ? "both" : mealType;
-  const { lunch, dinner } = deltasFor(requestType, finalMeal, detectQuantity(lower));
+  let finalMeal = requestType === "both_meals_cancel" ? "both" : mealType;
+  // "khana mat dena" / "khana band" / "mess band" / "food/meal band" with no
+  // specific meal named = BOTH meals cancelled (lunch -1, dinner -1 per day).
+  if (
+    requestType === "cancel_meal" && finalMeal === "none" &&
+    /(khana|khane|food|meal|mess|tiffin|dabba)/.test(lower)
+  ) {
+    requestType = "both_meals_cancel";
+    finalMeal = "both";
+  }
+
+  // For a date-range pause/cancel each day is a per-day change (-1), so the
+  // duration number ("3 din") must NOT be read as the meal quantity. Force the
+  // quantity to 1 whenever a duration was detected; otherwise use the normal
+  // quantity parser ("do lunch extra" -> 2).
+  const qty = durationDays != null ? 1 : detectQuantity(lower);
+  const { lunch, dinner } = deltasFor(requestType, finalMeal, qty);
 
   return {
     studentName: cleanSender(msg.sender),
@@ -1779,6 +1842,7 @@ function classify(msg: ChatMessage, today: string): ExtractedRequest | null {
     dinnerDelta: dinner,
     dateLabel,
     requestDate,
+    requestEndDate,
     confidence: Math.max(0, Math.min(1, confidence)),
     reason: "Matched by rule-based fallback parser.",
   };
