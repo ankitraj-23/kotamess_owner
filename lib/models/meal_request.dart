@@ -149,6 +149,10 @@ class MealRequest {
   /// True when this request carries an explicit quantity change for either meal.
   bool get hasQuantityChange => lunchDelta != 0 || dinnerDelta != 0;
 
+  /// True when the owner entered this request by hand (call / in-person /
+  /// outside the WhatsApp group) rather than importing it from a chat.
+  bool get isManual => source == 'manual';
+
   /// Short signed labels for the request card chips, e.g. "Lunch +2",
   /// "Dinner -1". Returns null for a meal with no change so the card can skip
   /// the chip (a 0 delta is not shown prominently).

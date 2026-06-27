@@ -33,6 +33,7 @@ import { createClient, SupabaseClient } from "https://esm.sh/@supabase/supabase-
 import { isGroupSystemLine, parseRosterEvents } from "./roster_parser.ts";
 import { messageFingerprint, parseTimestamp } from "./fingerprint.ts";
 import { clampDelta, deltasFor, detectQuantity } from "./quantity.ts";
+import { resolveMealDateFromText } from "./dates.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -1297,15 +1298,18 @@ async function extractCandidatesWithGemini(
 
   const out: ExtractedRequest[] = [];
   for (const raw of arr) {
-    const req = normalizeRequest(raw, today);
-    if (!req) continue;
     // Map back to the source candidate by index when the model returned one.
     // The candidate's sender + verbatim text are authoritative, so message_id
-    // linking (which matches on original_message) always succeeds.
+    // linking (which matches on original_message) always succeeds — and its
+    // timestamp is the base for resolving relative meal dates (aaj/kal/parso).
     const idxRaw = raw?.messageIndex ?? raw?.message_index ?? raw?.index;
     const idx = Number(idxRaw);
-    if (Number.isInteger(idx) && idx >= 0 && idx < batch.length) {
-      const src = batch[idx];
+    const src =
+      Number.isInteger(idx) && idx >= 0 && idx < batch.length ? batch[idx] : null;
+    const messageTs = src ? parseTimestamp(src.dateText) : null;
+    const req = normalizeRequest(raw, today, messageTs);
+    if (!req) continue;
+    if (src) {
       req.studentName = cleanSender(src.sender);
       req.originalMessage = src.text;
     }
@@ -1339,7 +1343,7 @@ Return ONLY a JSON object of this exact shape:
       "mealType": one of [${MEAL_TYPES.map((t) => `"${t}"`).join(", ")}],
       "lunchDelta": number,         // signed change to lunches: +N adds N, -N removes N, 0 = no change
       "dinnerDelta": number,        // signed change to dinners: +N adds N, -N removes N, 0 = no change
-      "dateLabel": string,          // e.g. "today","tomorrow","Sunday","unspecified"
+      "dateLabel": string,          // e.g. "today","tomorrow","day_after_tomorrow","Sunday","unspecified"
       "requestDate": "YYYY-MM-DD" | null,
       "confidence": number,         // 0..1
       "reason": string              // short why
@@ -1382,8 +1386,17 @@ Rules:
 - Do NOT invent student names; use the chat sender's name.
 - Preserve the original message text exactly in originalMessage.
 - If the date is unclear, set requestDate to null and dateLabel to "unspecified".
-- Resolve "aaj"/"today" to ${today}; "kal"/"tomorrow" to the next day; weekday
-  names to the next occurrence of that weekday.
+- Resolve relative day words against THAT MESSAGE'S timestamp (the [date time]
+  shown in brackets before the sender), NOT today's date. Today's date is only
+  for messages that carry no timestamp at all.
+    * aaj / aj / today      = message date
+    * kal / tomorrow        = message date + 1 day
+    * parso / parson / day after tomorrow = message date + 2 days
+    * a weekday name        = the next occurrence of that weekday after the
+                              message date
+  (These are operational mess requests, so "kal" always means TOMORROW, never
+  yesterday.) An explicit calendar date in the text (e.g. "28 June", "28/06")
+  takes priority over a relative word. Output requestDate as "YYYY-MM-DD".
 - confidence is 0..1; use low confidence for ambiguous messages.
 - If a message has no timestamp/date context, lean toward lower confidence when
   the timing is what makes it actionable.
@@ -1409,7 +1422,11 @@ function stripToJson(text: string): string {
   return t;
 }
 
-function normalizeRequest(r: any, today: string): ExtractedRequest | null {
+function normalizeRequest(
+  r: any,
+  today: string,
+  messageTs: Date | null = null,
+): ExtractedRequest | null {
   if (!r || typeof r !== "object") return null;
   const originalMessage = String(r.originalMessage ?? r.original_message ?? "").trim();
   if (originalMessage === "") return null;
@@ -1443,14 +1460,19 @@ function normalizeRequest(r: any, today: string): ExtractedRequest | null {
   if (!isFinite(confidence)) confidence = 0.5;
   confidence = Math.max(0, Math.min(1, confidence));
 
-  const dateLabel = String(r.dateLabel ?? r.date_label ?? "unspecified").trim() ||
+  // Date priority (req. 6): an explicit yyyy-mm-dd the model already resolved
+  // wins; otherwise resolve a relative word (aaj/kal/parso/…) against the
+  // MESSAGE timestamp; otherwise leave it null for the existing default path.
+  let dateLabel = String(r.dateLabel ?? r.date_label ?? "unspecified").trim() ||
     "unspecified";
   let requestDate: string | null = null;
   const rawDate = r.requestDate ?? r.request_date;
   if (typeof rawDate === "string" && /^\d{4}-\d{2}-\d{2}$/.test(rawDate)) {
     requestDate = rawDate;
   } else {
-    requestDate = resolveDate(dateLabel, today);
+    const dr = resolveMealDateFromText(originalMessage, messageTs, today);
+    requestDate = dr.date;
+    if (dr.label !== "unspecified") dateLabel = dr.label;
   }
 
   return {
@@ -1688,8 +1710,13 @@ function classify(msg: ChatMessage, today: string): ExtractedRequest | null {
   const has = (terms: string[]) => terms.some((t) => lower.includes(t));
 
   const mealType = detectMeal(lower);
-  const dateLabel = detectDateLabel(lower, msg.dateText);
-  const requestDate = resolveDate(dateLabel, today);
+  // Resolve the meal date against the MESSAGE timestamp (not the import date),
+  // falling back to `today` only when the message has no usable timestamp.
+  const { label: dateLabel, date: requestDate } = resolveMealDateFromText(
+    text,
+    parseTimestamp(msg.dateText),
+    today,
+  );
 
   let requestType: string | null = null;
   let confidence = 0.55;
@@ -1765,36 +1792,6 @@ function detectMeal(lower: string): string {
   if (dinner) return "dinner";
   if (/(dono|both)/.test(lower)) return "both";
   return "none";
-}
-
-function detectDateLabel(lower: string, _fallback: string): string {
-  if (/(aaj|today)/.test(lower)) return "today";
-  if (/(kal|tomorrow|tmrw)/.test(lower)) return "tomorrow";
-  const days = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
-  for (const d of days) {
-    if (lower.includes(d)) return d.charAt(0).toUpperCase() + d.slice(1);
-  }
-  return "unspecified";
-}
-
-function resolveDate(dateLabel: string, today: string): string | null {
-  const base = new Date(today + "T00:00:00Z");
-  if (isNaN(base.getTime())) return null;
-  const label = dateLabel.toLowerCase();
-  if (label === "today") return today;
-  if (label === "tomorrow") {
-    base.setUTCDate(base.getUTCDate() + 1);
-    return base.toISOString().slice(0, 10);
-  }
-  const days = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
-  const idx = days.indexOf(label);
-  if (idx !== -1) {
-    let diff = (idx - base.getUTCDay() + 7) % 7;
-    if (diff === 0) diff = 7; // next occurrence, not today
-    base.setUTCDate(base.getUTCDate() + diff);
-    return base.toISOString().slice(0, 10);
-  }
-  return null;
 }
 
 function isNoise(lower: string): boolean {

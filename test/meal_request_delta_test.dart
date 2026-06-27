@@ -67,6 +67,61 @@ void main() {
     });
   });
 
+  group('Manual requests', () {
+    test('isManual reflects the source field', () {
+      final manual = MealRequest.fromJson({
+        'id': 'a',
+        'owner_id': 'o',
+        'student_name': 'Aman',
+        'request_type': 'add_meal',
+        'meal_type': 'lunch',
+        'lunch_delta': 2,
+        'source': 'manual',
+      });
+      expect(manual.isManual, isTrue);
+
+      final imported = MealRequest.fromJson({
+        'id': 'b',
+        'owner_id': 'o',
+        'student_name': 'Aman',
+        'source': 'paste',
+      });
+      expect(imported.isManual, isFalse);
+    });
+
+    test('a confirmed manual request counts in the Daily totals', () {
+      // Mirrors createManualMealRequest: approved, linked, source manual.
+      final manual = MealRequest(
+        id: 'm1',
+        ownerId: 'owner-1',
+        studentId: 'stud-1',
+        studentName: 'Aman',
+        originalMessage: 'Manual request — Lunch +2',
+        requestType: 'add_meal',
+        mealType: 'lunch',
+        lunchDelta: 2,
+        dinnerDelta: 0,
+        requestDate: '2026-06-27',
+        dateLabel: null,
+        status: 'approved',
+        confidence: 1.0,
+        reason: 'Added manually by owner.',
+        source: 'manual',
+        createdAt: DateTime.parse('2026-06-27'),
+        linkStatus: 'linked',
+      );
+      final summary = DailySummary.compute(
+        date: '2026-06-27',
+        baseLunch: 40,
+        baseDinner: 40,
+        approvedRequests: [manual],
+        adjustments: const [],
+      );
+      expect(summary.finalLunch, 42);
+      expect(summary.finalDinner, 40);
+    });
+  });
+
   group('DailySummary applies quantity deltas', () {
     test('base 40 with +3 and -2 lunch deltas -> 41 to prepare', () {
       final summary = DailySummary.compute(

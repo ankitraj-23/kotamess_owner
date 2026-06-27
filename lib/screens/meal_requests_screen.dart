@@ -306,6 +306,42 @@ class MealRequestsScreenState extends State<MealRequestsScreen> {
         () => widget.databaseService.deleteMealRequest(r.id), 'Deleted');
   }
 
+  /// Owner-driven "Add request manually" flow for calls / in-person / off-group
+  /// requests. Opens the form, then inserts an already-confirmed request so it
+  /// shows in the list and counts in the Daily totals on next refresh.
+  Future<void> _addManual() async {
+    final List<Student> students;
+    try {
+      students = await widget.databaseService.fetchCustomers(status: 'active');
+    } catch (_) {
+      if (!mounted) return;
+      _showSnack('Could not load customers. Please try again.');
+      return;
+    }
+    if (!mounted) return;
+    if (students.isEmpty) {
+      _showSnack('Add an active customer first.', seconds: 2);
+      return;
+    }
+    final result = await showModalBottomSheet<_ManualRequestData>(
+      context: context,
+      isScrollControlled: true,
+      builder: (context) => _ManualRequestSheet(students: students),
+    );
+    if (result == null) return;
+    await _guard(
+      () => widget.databaseService.createManualMealRequest(
+        studentId: result.studentId,
+        studentName: result.studentName,
+        requestDate: result.requestDate,
+        lunchDelta: result.lunchDelta,
+        dinnerDelta: result.dinnerDelta,
+        ownerNote: result.ownerNote,
+      ),
+      'Request added',
+    );
+  }
+
   Future<void> _edit(MealRequest r) async {
     final updated = await showModalBottomSheet<MealRequest>(
       context: context,
@@ -343,11 +379,22 @@ class MealRequestsScreenState extends State<MealRequestsScreen> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Text('Review requests',
-                  style: Theme.of(context)
-                      .textTheme
-                      .headlineSmall
-                      ?.copyWith(fontWeight: FontWeight.w800)),
+              Row(
+                children: [
+                  Expanded(
+                    child: Text('Review requests',
+                        style: Theme.of(context)
+                            .textTheme
+                            .headlineSmall
+                            ?.copyWith(fontWeight: FontWeight.w800)),
+                  ),
+                  FilledButton.tonalIcon(
+                    onPressed: _addManual,
+                    icon: const Icon(Icons.add, size: 18),
+                    label: const Text('Add manually'),
+                  ),
+                ],
+              ),
               const SizedBox(height: 10),
               SingleChildScrollView(
                 scrollDirection: Axis.horizontal,
@@ -626,6 +673,7 @@ class _RequestCard extends StatelessWidget {
                 ] else if (request.mealType != 'none')
                   _Tag(request.mealTypeLabel),
                 _Tag(request.dateDisplay),
+                if (request.isManual) const _Tag('Manual'),
                 _StatusTag(status: request.status),
                 if (request.isLateRequest) const _LateTag(),
                 if (unresolved) _ResolveTag(label: request.linkStatusLabel),
@@ -1174,6 +1222,208 @@ class _DeltaStepperState extends State<_DeltaStepper> {
           onPressed: () => _set(widget.value + 1),
         ),
       ],
+    );
+  }
+}
+
+/// Result of the "Add request manually" form, handed back to the screen which
+/// owns the actual insert.
+class _ManualRequestData {
+  final String studentId;
+  final String studentName;
+  final String requestDate; // 'YYYY-MM-DD'
+  final int lunchDelta;
+  final int dinnerDelta;
+  final String ownerNote;
+  const _ManualRequestData({
+    required this.studentId,
+    required this.studentName,
+    required this.requestDate,
+    required this.lunchDelta,
+    required this.dinnerDelta,
+    required this.ownerNote,
+  });
+}
+
+/// Bottom sheet to manually add a confirmed lunch/dinner request for a customer
+/// who asked off the WhatsApp group (call / in-person). Mirrors the quantity
+/// controls of the edit sheet. Validates: a customer is chosen, a date is set,
+/// and at least one of lunch/dinner is a non-zero integer.
+class _ManualRequestSheet extends StatefulWidget {
+  final List<Student> students;
+  const _ManualRequestSheet({required this.students});
+
+  @override
+  State<_ManualRequestSheet> createState() => _ManualRequestSheetState();
+}
+
+class _ManualRequestSheetState extends State<_ManualRequestSheet> {
+  final _note = TextEditingController();
+  String? _studentId;
+  late String _requestDate;
+  int _lunchDelta = 0;
+  int _dinnerDelta = 0;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    final now = DateTime.now();
+    _requestDate = _fmt(now);
+  }
+
+  @override
+  void dispose() {
+    _note.dispose();
+    super.dispose();
+  }
+
+  static String _fmt(DateTime d) =>
+      '${d.year.toString().padLeft(4, '0')}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
+
+  Future<void> _pickDate() async {
+    final now = DateTime.now();
+    final initial = DateTime.tryParse(_requestDate) ?? now;
+    final picked = await showDatePicker(
+      context: context,
+      initialDate: initial,
+      firstDate: DateTime(now.year - 1),
+      lastDate: DateTime(now.year + 1),
+    );
+    if (picked != null) setState(() => _requestDate = _fmt(picked));
+  }
+
+  void _save() {
+    final id = _studentId;
+    if (id == null) {
+      setState(() => _error = 'Choose a customer.');
+      return;
+    }
+    if (_lunchDelta == 0 && _dinnerDelta == 0) {
+      setState(() => _error =
+          'Set a lunch or dinner change (e.g. +2 or -1). Both can’t be 0.');
+      return;
+    }
+    final student = widget.students.firstWhere((s) => s.id == id);
+    Navigator.pop(
+      context,
+      _ManualRequestData(
+        studentId: id,
+        studentName: student.name,
+        requestDate: _requestDate,
+        lunchDelta: _lunchDelta,
+        dinnerDelta: _dinnerDelta,
+        ownerNote: _note.text.trim(),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: EdgeInsets.only(
+        left: 16,
+        right: 16,
+        top: 16,
+        bottom: MediaQuery.of(context).viewInsets.bottom + 16,
+      ),
+      child: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text('Add request manually',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800)),
+            const SizedBox(height: 14),
+            DropdownButtonFormField<String>(
+              initialValue: _studentId,
+              isExpanded: true,
+              decoration: const InputDecoration(
+                labelText: 'Customer',
+                prefixIcon: Icon(Icons.person_outline),
+              ),
+              items: widget.students
+                  .map((s) => DropdownMenuItem(
+                        value: s.id,
+                        child: Text(s.name, overflow: TextOverflow.ellipsis),
+                      ))
+                  .toList(),
+              onChanged: (v) => setState(() {
+                _studentId = v;
+                _error = null;
+              }),
+            ),
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                Expanded(child: Text('Date: $_requestDate')),
+                TextButton.icon(
+                  onPressed: _pickDate,
+                  icon: const Icon(Icons.calendar_today, size: 18),
+                  label: const Text('Pick date'),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            _DeltaStepper(
+              label: 'Lunch change',
+              value: _lunchDelta,
+              onChanged: (v) => setState(() {
+                _lunchDelta = v;
+                _error = null;
+              }),
+            ),
+            const SizedBox(height: 12),
+            _DeltaStepper(
+              label: 'Dinner change',
+              value: _dinnerDelta,
+              onChanged: (v) => setState(() {
+                _dinnerDelta = v;
+                _error = null;
+              }),
+            ),
+            const SizedBox(height: 6),
+            Text('+2 means add 2, -1 means cancel/remove 1',
+                style: TextStyle(color: Colors.grey.shade600, fontSize: 12)),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _note,
+              minLines: 1,
+              maxLines: 3,
+              decoration: const InputDecoration(
+                labelText: 'Owner note (optional)',
+                prefixIcon: Icon(Icons.notes_outlined),
+              ),
+            ),
+            if (_error != null) ...[
+              const SizedBox(height: 10),
+              Text(_error!,
+                  style: TextStyle(
+                      color: Colors.red.shade700,
+                      fontSize: 13,
+                      fontWeight: FontWeight.w600)),
+            ],
+            const SizedBox(height: 18),
+            Row(
+              children: [
+                Expanded(
+                  child: OutlinedButton(
+                    onPressed: () => Navigator.pop(context),
+                    child: const Text('Cancel'),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: FilledButton(
+                    onPressed: _save,
+                    child: const Text('Add request'),
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
     );
   }
 }

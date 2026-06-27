@@ -415,6 +415,82 @@ class DatabaseService {
     return updated;
   }
 
+  /// Creates a meal request the owner enters by hand — for calls, in-person, or
+  /// any request that never came through the WhatsApp import. Priya is entering
+  /// it herself, so it is saved already confirmed (`status = 'approved'`) and
+  /// counts toward the Daily totals immediately via the same approved-request
+  /// path imported requests use. The signed [lunchDelta] / [dinnerDelta] carry
+  /// the quantity (+N add, -N remove); the UI guarantees at least one is
+  /// non-zero. `source = 'manual'` tags the origin (the column already exists,
+  /// so no migration is needed).
+  Future<MealRequest> createManualMealRequest({
+    required String studentId,
+    required String studentName,
+    required String requestDate, // 'YYYY-MM-DD'
+    required int lunchDelta,
+    required int dinnerDelta,
+    String ownerNote = '',
+  }) async {
+    final ownerId = getCurrentOwnerId();
+
+    // Derive a natural request_type / meal_type from the deltas so the request
+    // lists and labels read sensibly. The Daily count is delta-driven (see
+    // DailySummary), so these only affect display, never the math.
+    final hasAdd = lunchDelta > 0 || dinnerDelta > 0;
+    final requestType = hasAdd ? 'add_meal' : 'cancel_meal';
+    final touchesLunch = lunchDelta != 0;
+    final touchesDinner = dinnerDelta != 0;
+    final mealType = touchesLunch && touchesDinner
+        ? 'both'
+        : touchesDinner
+            ? 'dinner'
+            : 'lunch';
+
+    String signed(int v) => v > 0 ? '+$v' : '$v';
+    final parts = <String>[
+      if (touchesLunch) 'Lunch ${signed(lunchDelta)}',
+      if (touchesDinner) 'Dinner ${signed(dinnerDelta)}',
+    ];
+    final summary = 'Manual request — ${parts.join(', ')}';
+
+    final insert = {
+      'owner_id': ownerId,
+      'student_id': studentId,
+      'student_name': studentName.trim(),
+      'original_message': summary,
+      'request_type': requestType,
+      'meal_type': mealType,
+      'lunch_delta': lunchDelta,
+      'dinner_delta': dinnerDelta,
+      'request_date': requestDate,
+      'status': 'approved', // owner-entered -> already confirmed
+      'confidence': 1.0,
+      'reason': 'Added manually by owner.',
+      'owner_note': ownerNote.trim(),
+      'source': 'manual',
+      'link_status': 'linked', // resolved by the owner; counts in Daily totals
+    };
+    final row = await _client
+        .from('meal_requests')
+        .insert(insert)
+        .select()
+        .single();
+    final created = MealRequest.fromJson(Map<String, dynamic>.from(row));
+    await _writeAudit(
+      entityType: 'meal_request',
+      entityId: created.id,
+      action: 'manual_add',
+      newData: {
+        'student_name': studentName.trim(),
+        'lunch_delta': lunchDelta,
+        'dinner_delta': dinnerDelta,
+        'request_date': requestDate,
+        'source': 'manual',
+      },
+    );
+    return created;
+  }
+
   Future<void> deleteMealRequest(String id) async {
     final ownerId = getCurrentOwnerId();
     await _client
