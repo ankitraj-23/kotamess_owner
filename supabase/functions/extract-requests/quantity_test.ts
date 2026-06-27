@@ -2,7 +2,12 @@
 // Run: deno test supabase/functions/extract-requests/quantity_test.ts
 
 import { assertEquals } from "https://deno.land/std@0.168.0/testing/asserts.ts";
-import { clampDelta, deltasFor, detectQuantity } from "./quantity.ts";
+import {
+  clampDelta,
+  deltasFor,
+  detectQuantity,
+  isWholeFoodClosed,
+} from "./quantity.ts";
 
 // Mirror of normalize() in index.ts so test inputs match what the parser sees.
 function normalize(value: string): string {
@@ -60,6 +65,22 @@ Deno.test("deltasFor: non-meal types never carry a delta", () => {
   assertEquals(deltasFor("pause_mess", "both", 3), { lunch: 0, dinner: 0 });
   assertEquals(deltasFor("payment_note", "none", 2), { lunch: 0, dinner: 0 });
   assertEquals(deltasFor("unclear", "lunch", 5), { lunch: 0, dinner: 0 });
+});
+
+Deno.test("isWholeFoodClosed: bare band/bandh next to a food word", () => {
+  // The reported bug: "khana band" must be recognized as a whole-food close.
+  assertEquals(isWholeFoodClosed(normalize("kal se ek hafte tak khana band")), true);
+  assertEquals(isWholeFoodClosed(normalize("khana bandh")), true);
+  assertEquals(isWholeFoodClosed(normalize("food band kar dena")), true);
+});
+
+Deno.test("isWholeFoodClosed: false when not a food-close", () => {
+  // "mess band" stays a pause (no food word) — handled by the pause branch.
+  assertEquals(isWholeFoodClosed(normalize("kal se mess band")), false);
+  // Food word but no close word.
+  assertEquals(isWholeFoodClosed(normalize("khana extra dena")), false);
+  // "band" inside another word must not trigger (word-boundary guard).
+  assertEquals(isWholeFoodClosed(normalize("khana banana hai")), false);
 });
 
 Deno.test("clampDelta keeps integers within the sane cap", () => {

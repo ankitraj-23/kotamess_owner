@@ -53,6 +53,18 @@ export function clampDelta(n: number): number {
   return Math.max(-MAX_MEAL_DELTA, Math.min(MAX_MEAL_DELTA, i));
 }
 
+// "khana band" / "khana bandh" / "food band" — a bare close word ("band" /
+// "bandh", meaning closed/stopped) next to a FOOD word (not "mess") means the
+// whole day's food is off, i.e. BOTH meals. The rule-based classifier only
+// recognizes qualified forms ("mess band", "band kar", "din band"), so plain
+// "khana band" would otherwise fall through to "unclear" / "pause_mess" and
+// store 0/0 deltas. This predicate lets the classifier normalize those to a
+// both-meals cancel (-1 / -1) so they actually reduce the cook count.
+const FOOD_WORD_RE = /(khana|khane|food|tiffin|dabba|meal)/;
+export function isWholeFoodClosed(lower: string): boolean {
+  return FOOD_WORD_RE.test(lower) && /\b(band|bandh)\b/.test(lower);
+}
+
 // Signed per-meal deltas derived from a classified request + a quantity.
 // add_meal -> positive, cancel_meal / both_meals_cancel -> negative, every other
 // type -> 0 (no quantity meaning).

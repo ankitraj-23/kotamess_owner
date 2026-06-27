@@ -32,7 +32,7 @@ import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient, SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { isGroupSystemLine, parseRosterEvents } from "./roster_parser.ts";
 import { messageFingerprint, parseTimestamp } from "./fingerprint.ts";
-import { clampDelta, deltasFor, detectQuantity } from "./quantity.ts";
+import { clampDelta, deltasFor, detectQuantity, isWholeFoodClosed } from "./quantity.ts";
 import {
   detectDurationDays,
   resolveMealDateFromText,
@@ -1816,14 +1816,22 @@ function classify(msg: ChatMessage, today: string): ExtractedRequest | null {
   }
 
   let finalMeal = requestType === "both_meals_cancel" ? "both" : mealType;
-  // "khana mat dena" / "khana band" / "mess band" / "food/meal band" with no
-  // specific meal named = BOTH meals cancelled (lunch -1, dinner -1 per day).
+  // Whole-day food cancellation with no specific meal named = BOTH meals
+  // (lunch -1, dinner -1 per day). Two ways in:
+  //   * cancel_meal + a food word ("khana mat dena", "food cancel").
+  //   * a bare "band"/"bandh" close word next to a food word ("khana band",
+  //     "khana bandh") — these otherwise land in "unclear"/"pause_mess" and
+  //     store 0/0 deltas, so the range pause never reduces the count.
   if (
-    requestType === "cancel_meal" && finalMeal === "none" &&
-    /(khana|khane|food|meal|mess|tiffin|dabba)/.test(lower)
+    finalMeal === "none" &&
+    ((requestType === "cancel_meal" &&
+      /(khana|khane|food|meal|mess|tiffin|dabba)/.test(lower)) ||
+      ((requestType === "unclear" || requestType === "pause_mess") &&
+        isWholeFoodClosed(lower)))
   ) {
     requestType = "both_meals_cancel";
     finalMeal = "both";
+    if (confidence < 0.66) confidence = 0.66;
   }
 
   // For a date-range pause/cancel each day is a per-day change (-1), so the

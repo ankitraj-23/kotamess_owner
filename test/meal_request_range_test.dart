@@ -94,6 +94,12 @@ void main() {
       expect(s.finalDinner, 39);
     });
 
+    test('counts on the second day of the range', () {
+      final s = _summaryOn('2026-06-29', [week]);
+      expect(s.finalLunch, 39);
+      expect(s.finalDinner, 39);
+    });
+
     test('counts on a middle day inside the range', () {
       final s = _summaryOn('2026-07-01', [week]);
       expect(s.finalLunch, 39);
