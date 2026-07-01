@@ -18,7 +18,6 @@ class UsageEvidenceScreen extends StatefulWidget {
 
 class _UsageEvidenceScreenState extends State<UsageEvidenceScreen> {
   static const _accent = Color(0xFF16A34A);
-  static const _amber = Color(0xFFD97706);
   static const _months = [
     'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
     'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
@@ -113,8 +112,6 @@ class _UsageEvidenceScreenState extends State<UsageEvidenceScreen> {
         children: [
           _summarySection(e, currentRange, previousRange),
           const SizedBox(height: 12),
-          _requirementSection(e),
-          const SizedBox(height: 12),
           _heatmapSection(e),
           const SizedBox(height: 12),
           _dailySection(e),
@@ -207,41 +204,7 @@ class _UsageEvidenceScreenState extends State<UsageEvidenceScreen> {
     );
   }
 
-  // --- 2. Requirement status ----------------------------------------------
-  Widget _requirementSection(UsageEvidence e) {
-    final met = e.activeDaysThisWeek >= 5 && e.activeDaysLastWeek >= 5;
-    final color = met ? _accent : _amber;
-    return SectionCard(
-      title: 'Requirement',
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              Icon(met ? Icons.check_circle : Icons.hourglass_bottom,
-                  color: color, size: 22),
-              const SizedBox(width: 10),
-              const Expanded(
-                child: Text('5+ active days/week × 2 periods',
-                    style: TextStyle(fontWeight: FontWeight.w800)),
-              ),
-            ],
-          ),
-          const SizedBox(height: 8),
-          InfoPill(met ? 'Requirement met' : 'Requirement not met yet',
-              color: color),
-          const SizedBox(height: 10),
-          Text(
-            'Active day = chat import or audited owner action such as request '
-            'review or customer update.',
-            style: TextStyle(color: Colors.grey.shade600, fontSize: 12),
-          ),
-        ],
-      ),
-    );
-  }
-
-  // --- 3. 14-day heatmap --------------------------------------------------
+  // --- 2. 14-day heatmap --------------------------------------------------
   Widget _heatmapSection(UsageEvidence e) {
     final days = e.dailyActivity; // oldest -> newest, 14 entries
     final firstWeek = days.length <= 7 ? days : days.sublist(0, 7);
