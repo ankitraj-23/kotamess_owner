@@ -14,6 +14,7 @@ import '../models/meal_request.dart';
 import '../models/monthly_bill.dart';
 import '../models/payment.dart';
 import '../models/student.dart';
+import '../models/usage_evidence.dart';
 import 'money_utils.dart';
 import 'name_utils.dart';
 import 'student_roster_import_service.dart';
@@ -1431,6 +1432,205 @@ class DatabaseService {
       return bt.compareTo(at);
     });
     return items.take(10).toList();
+  }
+
+  // --- Usage evidence -----------------------------------------------------
+
+  /// Review decisions that count as "the owner acted on a request". Excludes
+  /// passive/creation actions (`note`, `manual_add`, `delete`).
+  static const _reviewActions = {
+    'confirm',
+    'reject',
+    'cancel',
+    'complete',
+    'edit',
+  };
+
+  /// The local calendar day (midnight) for a Supabase UTC timestamp, so
+  /// active-day grouping matches what the owner sees on their device (IST).
+  static DateTime _localDay(DateTime t) {
+    final l = t.toLocal();
+    return DateTime(l.year, l.month, l.day);
+  }
+
+  /// Aggregates privacy-safe proof of real usage from existing production
+  /// tables — no dedicated events table. See [UsageEvidence] for the time
+  /// windows. All queries are owner-scoped; heavy filtering is done in Dart on
+  /// small, recent result sets.
+  Future<UsageEvidence> fetchUsageEvidence() async {
+    final ownerId = getCurrentOwnerId();
+    final now = DateTime.now();
+    final today = DateTime(now.year, now.month, now.day);
+    final weekStart = today.subtract(const Duration(days: 6)); // last 7 days
+    final lastWeekStart = today.subtract(const Duration(days: 13));
+
+    // Recent imports and audited actions, newest first; windowed in Dart.
+    final importRows = await _client
+        .from('chat_imports')
+        .select()
+        .eq('owner_id', ownerId)
+        .order('created_at', ascending: false)
+        .limit(100);
+    final imports = importRows
+        .map((e) => ChatImport.fromJson(Map<String, dynamic>.from(e)))
+        .toList();
+
+    final auditRows = await _client
+        .from('audit_logs')
+        .select()
+        .eq('owner_id', ownerId)
+        .order('created_at', ascending: false)
+        .limit(300);
+    final audits = auditRows
+        .map((e) => AuditLog.fromJson(Map<String, dynamic>.from(e)))
+        .toList();
+
+    // Live pending snapshot (not windowed).
+    final pendingRows = await _client
+        .from('meal_requests')
+        .select('id')
+        .eq('owner_id', ownerId)
+        .eq('status', 'pending');
+    final pendingNow = pendingRows.length;
+
+    // Request-review actions only (drops customer/plan audit rows).
+    final requestReviews = audits
+        .where((a) =>
+            a.entityType == 'meal_request' && _reviewActions.contains(a.action))
+        .toList();
+
+    // Distinct active days = any import OR any audited action that day.
+    final activeDays = <DateTime>{};
+    DateTime? lastActiveAt;
+    void bumpActive(DateTime? t) {
+      if (t == null) return;
+      activeDays.add(_localDay(t));
+      if (lastActiveAt == null || t.isAfter(lastActiveAt!)) lastActiveAt = t;
+    }
+
+    DateTime? lastImportAt;
+    for (final imp in imports) {
+      bumpActive(imp.createdAt);
+      final t = imp.createdAt;
+      if (t != null && (lastImportAt == null || t.isAfter(lastImportAt))) {
+        lastImportAt = t;
+      }
+    }
+    for (final a in audits) {
+      bumpActive(a.createdAt);
+    }
+
+    int activeDaysIn(DateTime start, DateTime endExclusive) => activeDays
+        .where((d) => !d.isBefore(start) && d.isBefore(endExclusive))
+        .length;
+    final activeDaysThisWeek =
+        activeDays.where((d) => !d.isBefore(weekStart)).length;
+    final activeDaysLastWeek = activeDaysIn(lastWeekStart, weekStart);
+
+    // Current streak: consecutive active days ending today (grace: fall back to
+    // yesterday if today has no activity yet).
+    var cursor =
+        activeDays.contains(today) ? today : today.subtract(const Duration(days: 1));
+    var currentStreakDays = 0;
+    while (activeDays.contains(cursor)) {
+      currentStreakDays++;
+      cursor = cursor.subtract(const Duration(days: 1));
+    }
+
+    bool inThisWeek(DateTime? t) =>
+        t != null && !_localDay(t).isBefore(weekStart);
+    int reviewCount(String action) => requestReviews
+        .where((a) => a.action == action && inThisWeek(a.createdAt))
+        .length;
+
+    final confirmedThisWeek = reviewCount('confirm');
+    final editedThisWeek = reviewCount('edit');
+    final rejectedThisWeek = reviewCount('reject');
+    final completedThisWeek = reviewCount('complete');
+    final requestsReviewedThisWeek =
+        requestReviews.where((a) => inThisWeek(a.createdAt)).length;
+
+    final weekImports =
+        imports.where((i) => inThisWeek(i.createdAt)).toList();
+    final importsThisWeek = weekImports.length;
+    final messagesImportedThisWeek =
+        weekImports.fold<int>(0, (s, i) => s + i.processedMessages);
+    final extractedThisWeek =
+        weekImports.fold<int>(0, (s, i) => s + i.extractedCount);
+    final duplicatesSkippedThisWeek =
+        weekImports.fold<int>(0, (s, i) => s + i.duplicateCount);
+
+    // 14-day strip, oldest → newest.
+    final dailyActivity = <UsageDayActivity>[];
+    for (var i = 13; i >= 0; i--) {
+      final day = today.subtract(Duration(days: i));
+      final dayImports = imports
+          .where((imp) =>
+              imp.createdAt != null && _localDay(imp.createdAt!) == day)
+          .toList();
+      final dayReviews = requestReviews
+          .where((a) => a.createdAt != null && _localDay(a.createdAt!) == day)
+          .length;
+      dailyActivity.add(UsageDayActivity(
+        date: day,
+        imports: dayImports.length,
+        messagesProcessed:
+            dayImports.fold<int>(0, (s, i) => s + i.processedMessages),
+        extracted: dayImports.fold<int>(0, (s, i) => s + i.extractedCount),
+        reviewed: dayReviews,
+        duplicatesSkipped:
+            dayImports.fold<int>(0, (s, i) => s + i.duplicateCount),
+        active: activeDays.contains(day),
+      ));
+    }
+
+    // Privacy-safe feed: import runs + request-review actions, newest first.
+    // No raw message text, no ids.
+    final feed = <UsageEvidenceActivityItem>[];
+    for (final imp in imports.take(8)) {
+      feed.add(UsageEvidenceActivityItem(
+        kind: 'import',
+        title: 'Imported WhatsApp chat',
+        subtitle:
+            '${imp.processedMessages} messages · ${imp.extractedCount} requests found',
+        timestamp: imp.createdAt,
+      ));
+    }
+    for (final a in requestReviews.take(8)) {
+      feed.add(UsageEvidenceActivityItem(
+        kind: 'review',
+        title: a.label, // e.g. "Confirmed request"
+        subtitle: 'Request reviewed',
+        timestamp: a.createdAt,
+      ));
+    }
+    feed.sort((x, y) {
+      final tx = x.timestamp, ty = y.timestamp;
+      if (tx == null && ty == null) return 0;
+      if (tx == null) return 1;
+      if (ty == null) return -1;
+      return ty.compareTo(tx);
+    });
+
+    return UsageEvidence(
+      activeDaysThisWeek: activeDaysThisWeek,
+      activeDaysLastWeek: activeDaysLastWeek,
+      currentStreakDays: currentStreakDays,
+      lastActiveAt: lastActiveAt,
+      lastImportAt: lastImportAt,
+      requestsReviewedThisWeek: requestsReviewedThisWeek,
+      extractedThisWeek: extractedThisWeek,
+      confirmedThisWeek: confirmedThisWeek,
+      editedThisWeek: editedThisWeek,
+      rejectedThisWeek: rejectedThisWeek,
+      completedThisWeek: completedThisWeek,
+      pendingNow: pendingNow,
+      importsThisWeek: importsThisWeek,
+      messagesImportedThisWeek: messagesImportedThisWeek,
+      duplicatesSkippedThisWeek: duplicatesSkippedThisWeek,
+      dailyActivity: dailyActivity,
+      recentActivity: feed.take(10).toList(),
+    );
   }
 
   // --- Daily count --------------------------------------------------------
