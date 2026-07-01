@@ -2,10 +2,12 @@ import 'package:flutter/material.dart';
 
 import '../models/dashboard.dart';
 import '../models/kitchen_summary.dart';
+import '../models/usage_evidence.dart';
 import '../profile/owner_profile.dart';
 import '../services/database_service.dart';
 import '../services/recent_activity_prefs.dart';
 import '../widgets/common.dart';
+import 'usage_evidence_screen.dart';
 
 /// Owner dashboard: greeting, today's & tomorrow's kitchen summary, key
 /// tallies, quick actions and a recent-activity feed. All figures are live
@@ -134,7 +136,10 @@ class HomeScreenState extends State<HomeScreen> {
           const SizedBox(height: 16),
           _KitchenCard(title: "Today's kitchen", summary: s.today),
           const SizedBox(height: 12),
-          _KitchenCard(title: "Tomorrow's kitchen", summary: s.tomorrow),
+          // Tomorrow's kitchen was here; replaced by the Usage Evidence card.
+          // The tomorrow count (s.tomorrow) is still computed in the backend
+          // and remains available for other screens.
+          _UsageEvidenceCard(databaseService: widget.databaseService),
           const SizedBox(height: 16),
           _StatsGrid(summary: s),
           const SizedBox(height: 16),
@@ -172,6 +177,230 @@ class HomeScreenState extends State<HomeScreen> {
           const SizedBox(height: 24),
         ],
       ),
+    );
+  }
+}
+
+/// Compact proof-of-usage summary shown on Home in place of the old
+/// "Tomorrow's kitchen" card. Loads its own data once (not on every Home
+/// rebuild) so a slow/failed evidence fetch never blocks the dashboard, and
+/// opens the full [UsageEvidenceScreen] on tap.
+class _UsageEvidenceCard extends StatefulWidget {
+  const _UsageEvidenceCard({required this.databaseService});
+
+  final DatabaseService databaseService;
+
+  @override
+  State<_UsageEvidenceCard> createState() => _UsageEvidenceCardState();
+}
+
+class _UsageEvidenceCardState extends State<_UsageEvidenceCard> {
+  static const _accent = Color(0xFF16A34A);
+
+  bool _loading = true;
+  bool _failed = false;
+  UsageEvidence? _evidence;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    setState(() {
+      _loading = true;
+      _failed = false;
+    });
+    try {
+      final e = await widget.databaseService.fetchUsageEvidence();
+      if (!mounted) return;
+      setState(() {
+        _evidence = e;
+        _loading = false;
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _failed = true;
+        _loading = false;
+      });
+    }
+  }
+
+  void _openFull() {
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) =>
+            UsageEvidenceScreen(databaseService: widget.databaseService),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_loading) {
+      return const SectionCard(
+        title: 'Usage',
+        child: Row(
+          children: [
+            SizedBox(
+              width: 18,
+              height: 18,
+              child: CircularProgressIndicator(strokeWidth: 2),
+            ),
+            SizedBox(width: 12),
+            Text('Loading usage…'),
+          ],
+        ),
+      );
+    }
+    final e = _evidence;
+    if (_failed || e == null) {
+      return SectionCard(
+        title: 'Usage',
+        child: Row(
+          children: [
+            Icon(Icons.cloud_off, size: 20, color: Colors.grey.shade500),
+            const SizedBox(width: 10),
+            const Expanded(child: Text('Usage unavailable')),
+            TextButton(onPressed: _load, child: const Text('Retry')),
+          ],
+        ),
+      );
+    }
+    return GestureDetector(
+      onTap: _openFull,
+      child: SectionCard(
+        title: 'Usage',
+        trailing: const Icon(Icons.chevron_right, color: _accent),
+        child: e.isEmpty ? _empty() : _content(e),
+      ),
+    );
+  }
+
+  Widget _empty() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Icon(Icons.insights_outlined, color: Colors.grey.shade400),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Text(
+                'No usage yet. Import chats and review requests to build your '
+                'usage.',
+                style: TextStyle(color: Colors.grey.shade600),
+              ),
+            ),
+          ],
+        ),
+        Align(
+          alignment: Alignment.centerLeft,
+          child: TextButton(
+            onPressed: _openFull,
+            child: const Text('View usage'),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _content(UsageEvidence e) {
+    // Rolling windows, computed in the UI from local "today" — mirrors the
+    // backend definition (current = today + previous 6 days; previous = the 7
+    // days before that). Display only; no calculation change.
+    final now = DateTime.now();
+    final today = DateTime(now.year, now.month, now.day);
+    final currentStart = today.subtract(const Duration(days: 6));
+    final previousStart = today.subtract(const Duration(days: 13));
+    final previousEnd = today.subtract(const Duration(days: 7));
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Expanded(
+              child: _metric(
+                'Current period',
+                formatDayRange(currentStart, today),
+                '${e.activeDaysThisWeek}/7',
+                'active days',
+              ),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: _metric(
+                'Previous period',
+                formatDayRange(previousStart, previousEnd),
+                '${e.activeDaysLastWeek}/7',
+                'active days',
+              ),
+            ),
+          ],
+        ),
+        const Divider(height: 20),
+        _line(Icons.fact_check_outlined, 'Requests reviewed',
+            '${e.requestsReviewedThisWeek}'),
+        const SizedBox(height: 8),
+        _line(
+          Icons.upload_file,
+          'Last import',
+          e.lastImportAt == null ? 'No imports yet' : formatStamp(e.lastImportAt),
+        ),
+        Align(
+          alignment: Alignment.centerLeft,
+          child: TextButton(
+            onPressed: _openFull,
+            child: const Text('View usage'),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _metric(String label, String range, String value, String sub) {
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: _accent.withValues(alpha: 0.08),
+        borderRadius: BorderRadius.circular(14),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(label,
+              style: TextStyle(
+                  color: Colors.grey.shade600,
+                  fontSize: 12,
+                  fontWeight: FontWeight.w600)),
+          Text(range,
+              style: TextStyle(color: Colors.grey.shade500, fontSize: 11)),
+          const SizedBox(height: 4),
+          Text(value,
+              style: const TextStyle(
+                  fontSize: 22, fontWeight: FontWeight.w900, color: _accent)),
+          Text(sub,
+              style: TextStyle(color: Colors.grey.shade600, fontSize: 11)),
+        ],
+      ),
+    );
+  }
+
+  Widget _line(IconData icon, String label, String value) {
+    return Row(
+      children: [
+        Icon(icon, size: 18, color: Colors.grey.shade600),
+        const SizedBox(width: 10),
+        Expanded(
+          child: Text(label,
+              style: const TextStyle(
+                  fontWeight: FontWeight.w600, fontSize: 13)),
+        ),
+        Text(value,
+            style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 13)),
+      ],
     );
   }
 }

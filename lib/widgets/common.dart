@@ -155,6 +155,17 @@ String relativeTime(DateTime? time) {
   return '${d.day}/${d.month}/${d.year % 100}';
 }
 
+/// Compact local date range like "25 Jun – 1 Jul" (no intl, no year).
+String formatDayRange(DateTime start, DateTime end) {
+  const months = [
+    'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+    'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
+  ];
+  final s = start.toLocal();
+  final e = end.toLocal();
+  return '${s.day} ${months[s.month - 1]} – ${e.day} ${months[e.month - 1]}';
+}
+
 /// Compact absolute timestamp like "14 Jun 2026, 3:05 pm" (local time, no intl).
 String formatStamp(DateTime? time) {
   if (time == null) return '—';
